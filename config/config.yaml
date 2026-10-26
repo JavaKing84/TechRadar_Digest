@@ -1,0 +1,77 @@
+# =====================================================================
+# [文件] news_ai_science/config.yaml
+# [职责] 「AI 科技新闻机器人」的全部配置。与 news_ai_job 完全独立，
+#        不共享任何配置变量（两个 webhook 虽同群，但各绑一个独立机器人）。
+# [说明] 本文件不含任何密钥，可以提交到公开仓库。
+#        密钥统一放项目根目录的 .env（已被 .gitignore 排除），
+#        字段对照见 .env.example；环境变量优先级最高。
+# =====================================================================
+
+project: news_ai_science
+display_name: "AI 科技头条"
+
+# ---- 推送通道（本项目专属）----
+# [现状] 正式目标群 = iDeal工作室。两个子项目在该群各挂一个自定义机器人，
+#        token 互不复用（各自 .env 各自填，别串）。
+#        代码只读 webhook_url；webhook_2 仅作备用槽位（暂不读）。
+# 实际取值来自 .env 的 FEISHU_WEBHOOK_URL；此处留空防泄露
+webhook_url: ""
+webhook_secret: ""        # 群机器人开了「加签」才填，免签留空（env: FEISHU_WEBHOOK_SECRET）
+webhook_2: ""             # 备用槽位：换机器人时先把旧地址挪到这里留档
+
+# ---- 目标群（仅用于日志与回执标注，不参与寻址）----
+# [说明] 群机器人 webhook 在「添加机器人到群」时就已绑定到那个群，
+#        飞书不提供「按群名投递」的能力。这里写的是"这条消息应该落在哪"，
+#        推送日志会出现「已投递到群「iDeal工作室」」；若实际收到的群不同，
+#        说明 webhook_url 填的是别的群的机器人，改 URL 即可。
+chat_name: "iDeal工作室"
+
+# ---- 飞书自建应用（卡片配图 img_key 必须走应用凭证，群机器人没这个权限）----
+# 实际取值来自 .env 的 FEISHU_APP_ID / FEISHU_APP_SECRET
+feishu_app:
+  app_id: ""
+  app_secret: ""
+
+# ---- 大模型（OpenAI 兼容协议）----
+# 实际取值来自 .env 的 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL
+llm:
+  base_url: ""
+  api_key: ""
+  model: ""
+  temperature: 0.2
+  max_tokens: 6000        # 该模型会先吃掉 reasoning_tokens，给少会把正文挤成空串（实测 3500 仍会空）
+  timeout: 120
+  retries: 1
+  # [关键] 关闭思考模式
+  # 实测该模型会先花 completion 预算做 reasoning：2796 字英文正文能把 3500 token
+  # 全烧在思考上，正文返回空串（finish_reason=length）。关掉后同样输入
+  # completion 从 1663 降到 114、单条耗时从 15 秒降到 2 秒，摘要照常产出。
+  # 若哪天服务端不认这个参数，代码会自动换回思考模式重试一次。
+  disable_thinking: true
+
+# ---- 抓取 ----
+# [数量] 目标是「每轮凑够 4 条**全新**文章」：去重在链接层做（已入库的直接不打开），
+#        所以 total_limit 数的是新文章，不是列表页前几条。
+crawl:
+  headless: true          # 新闻站无头即可，快且不弹窗
+  max_items_per_source: 3 # 每个源取几篇正文（正文页最耗时；3 篇让去重后仍有候选余量）
+  total_limit: 4          # 一轮要凑够几篇「全新」文章（跨源上限，抓够即停）
+  require_image: true     # 铁律：没有配图的新闻直接跳过，绝不用乱图凑
+  bypass_proxy: false     # 本机直连被封，走环境代理才通；直连可用的机器才能开
+  min_body_chars: 300     # 正文短于这个数视为抽取失败，丢弃该篇
+
+# ---- 新闻源 ----
+# [说明] 源清单已拆到 config/sources.yaml（改源不用碰本文件），
+#        这里不再保留 news_sources，避免两份真相打架。
+
+# ---- 推送 ----
+push:
+  per_run: 4              # 每次推送几条（聚合到同一张卡里，上限 5：再多飞书客户端会卡）
+  cooldown_hours: 4       # 同一条新闻再次被轮换推送的最小间隔
+
+# ---- 存储与日志 ----
+storage:
+  db_path: "data/news_ai_science.db"
+logging:
+  dir: "logs"
+  level: "INFO"

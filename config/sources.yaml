@@ -1,0 +1,40 @@
+# =====================================================================
+# [文件] news_ai_science/config/sources.yaml
+# [职责] 新闻源清单。改源只改这里，不碰带密钥的 config.yaml。
+# [规则] 只抓文章页，绝不碰 RSS；enabled: false 的源直接跳过并打 WARNING。
+# =====================================================================
+
+sources:
+  - id: techcrunch
+    name: TechCrunch AI
+    url: "https://techcrunch.com/category/artificial-intelligence/"
+    enabled: true
+
+  - id: mit_tr
+    name: MIT Technology Review
+    url: "https://www.technologyreview.com/topic/artificial-intelligence/"
+    enabled: true
+
+  - id: wired
+    name: Wired AI
+    url: "https://www.wired.com/tag/artificial-intelligence/"
+    enabled: true
+
+  # [实测] VentureBeat 可正常抓取，作为第 4 个可用源补位
+  - id: venturebeat
+    name: VentureBeat
+    url: "https://venturebeat.com/"
+    enabled: true
+
+  # [停用] 整站被反爬拦死：页面只剩 "Let's confirm you are human"，0 个链接，
+  # 可见窗口（headless=False）同样过不去。等有可用代理/指纹方案再开。
+  - id: arstechnica
+    name: Ars Technica
+    url: "https://arstechnica.com/ai/"
+    enabled: false
+
+  # [停用] 实测 45s 稳定超时（网络出口问题）；能通了改 true 即可。
+  - id: theverge
+    name: The Verge AI
+    url: "https://www.theverge.com/ai-artificial-intelligence"
+    enabled: false

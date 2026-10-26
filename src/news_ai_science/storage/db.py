@@ -1,0 +1,213 @@
+# -*- coding: utf-8 -*-
+"""
+=====================================================================
+[文件] news_ai_science/storage/db.py
+[职责] 新闻条目的 SQLite 持久化：去重、待推队列、轮换历史。
+      标准库 sqlite3，不引 ORM——本项目只有一张表。
+
+[去重键] canonical = host + path（归一化后），**绝不用标题去重**。
+      标题会因「多家媒体同题」「翻译抖动」「标题党改写」而误判，
+      不同语言/不同媒体的标题更是必然不同；只有 URL 路径是稳定标识。
+=====================================================================
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from news_ai_science.core.logger import get_logger
+from news_ai_science.core.text import canonical_url
+
+logger = get_logger(__name__)
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS articles (
+    url         TEXT PRIMARY KEY,          -- 原始 URL（保留，便于回溯与打开原文）
+    canonical   TEXT,                      -- 去重键：host+path，无 query/fragment
+    title       TEXT NOT NULL,             -- 中文标题
+    source_name TEXT,
+    payload     TEXT NOT NULL,             -- {title_zh, summaries, image_key, cover_image, is_fallback}
+    status      TEXT NOT NULL DEFAULT 'pending',   -- pending / pushed
+    created_at  TEXT NOT NULL,
+    pushed_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_articles_status ON articles(status, created_at);
+"""
+
+
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+class NewsStore:
+    """
+    # [表面] 一张 articles 表 + 几个方法
+    # [本质] canonical 上的唯一索引天然去重；status 做 pending/pushed 状态机，
+    #        推送失败保持 pending，下一轮自动补发
+    # [后果] 同一篇文章不会被推两次（哪怕 URL 带了不同的 utm 尾巴），也不会漏掉没推成功的
+    """
+
+    def __init__(self, db_path: str) -> None:
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self.db_path = db_path
+        self._conn = sqlite3.connect(db_path)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.executescript(SCHEMA)
+        self._conn.commit()
+        self._migrate_canonical()
+
+    # ---------------------------------------------------------------
+    # 迁移：老库没有 canonical 列 / 老行没填 canonical
+    # ---------------------------------------------------------------
+    def _migrate_canonical(self) -> None:
+        """
+        # [表面] 补列 + 回填 + 建唯一索引
+        # [本质] 切换去重键不能要求用户删库：老行的 url 就是原始 URL，
+        #        按同一套规则算一遍 canonical 填回去，历史记录的去重语义保持不变
+        # [后果] 新版启动后老数据照常去重，不会把历史文章当成新文章再推一遍
+        """
+        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(articles)")}
+        if "canonical" not in cols:
+            self._conn.execute("ALTER TABLE articles ADD COLUMN canonical TEXT")
+            self._conn.commit()
+            logger.info("[DB] 已为老库补上 canonical 列")
+
+        pending = self._conn.execute(
+            "SELECT url FROM articles WHERE canonical IS NULL OR canonical = ''"
+        ).fetchall()
+        if pending:
+            self._conn.executemany(
+                "UPDATE articles SET canonical = ? WHERE url = ?",
+                [(canonical_url(row["url"]), row["url"]) for row in pending],
+            )
+            self._conn.commit()
+            logger.info("[DB] 回填 canonical %d 条历史记录", len(pending))
+
+        try:
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_canonical ON articles(canonical)"
+            )
+            self._conn.commit()
+        except sqlite3.IntegrityError:
+            # [表面] 历史里已存在同 canonical 的重复行，唯一索引建不上
+            # [本质] 这是切换去重键之前的遗留脏数据；不能用删行解决（会丢历史），
+            #        退化成普通索引，靠 is_seen 的等值查询照样能去重
+            # [后果] 去重功能不受影响，只是少一层数据库级兜底，日志里有 WARNING
+            logger.warning("[DB] canonical 存在重复历史行，唯一索引降级为普通索引")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_articles_canonical_nu ON articles(canonical)"
+            )
+            self._conn.commit()
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------------
+    # 去重
+    # ---------------------------------------------------------------
+    def is_seen(self, url: str) -> bool:
+        """
+        # [表面] 这个 URL 是否已入库（含已推）
+        # [本质] 用归一化后的 canonical 比对，而不是原始 URL 字符串；
+        #        同时兼容老行（原始 url 相同也算见过）
+        # [后果] 带 ?utm_source=... 的同一篇文章不会被当成新的
+        """
+        key = canonical_url(url)
+        if not key:
+            return False
+        cur = self._conn.execute(
+            "SELECT 1 FROM articles WHERE canonical = ? OR url = ? LIMIT 1", (key, url)
+        )
+        return cur.fetchone() is not None
+
+    def save(self, url: str, title: str, source_name: str, payload: dict) -> bool:
+        """入库；canonical 已存在则忽略。返回 True 表示新入库。"""
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO articles (url, canonical, title, source_name, payload, status, created_at)"
+            " VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+            (url, canonical_url(url), title, source_name,
+             json.dumps(payload, ensure_ascii=False), _now()),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    # ---------------------------------------------------------------
+    # 取待推
+    # ---------------------------------------------------------------
+    def pick_pending_many(self, limit: int) -> list[dict]:
+        """取最早入库的 limit 条待推新闻（一张聚合卡要放的量）。"""
+        if limit <= 0:
+            return []
+        cur = self._conn.execute(
+            "SELECT * FROM articles WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",
+            (limit,),
+        )
+        return [self._row_to_dict(row) for row in cur.fetchall()]
+
+    def pick_pending(self) -> dict | None:
+        """取最早入库的一条待推新闻。"""
+        rows = self.pick_pending_many(1)
+        return rows[0] if rows else None
+
+    def pick_rotate_many(self, limit: int, cooldown_hours: float = 4) -> list[dict]:
+        """
+        # [表面] 没有新条目时，从历史里挑最久没推的 limit 条
+        # [本质] 周末源站更新慢，一直等新的会让群里断更；cooldown 挡住
+        #        「刚推完又推同一条」
+        # [后果] 新闻不断更，也不短时间重复
+        """
+        if limit <= 0:
+            return []
+        cutoff = (datetime.now() - timedelta(hours=cooldown_hours)).strftime("%Y-%m-%d %H:%M:%S")
+        cur = self._conn.execute(
+            "SELECT * FROM articles WHERE status = 'pushed' AND (pushed_at IS NULL OR pushed_at <= ?)"
+            " ORDER BY pushed_at ASC LIMIT ?",
+            (cutoff, limit),
+        )
+        return [self._row_to_dict(row) for row in cur.fetchall()]
+
+    def pick_rotate(self, cooldown_hours: float = 4) -> dict | None:
+        """
+        # [表面] 没有新条目时，从历史里挑最久没推的一条
+        # [本质] 周末源站更新慢，一直等新的会让群里断更；cooldown 挡住
+        #        「刚推完又推同一条」
+        # [后果] 新闻不断更，也不短时间重复
+        """
+        rows = self.pick_rotate_many(1, cooldown_hours)
+        return rows[0] if rows else None
+
+    # ---------------------------------------------------------------
+    # 状态流转
+    # ---------------------------------------------------------------
+    def mark_pushed_many(self, urls: list[str]) -> None:
+        """一张聚合卡里可能有多条，全部标 pushed（否则下一轮会重复推）。"""
+        if not urls:
+            return
+        now = _now()
+        self._conn.executemany(
+            "UPDATE articles SET status = 'pushed', pushed_at = ? WHERE url = ?",
+            [(now, url) for url in urls],
+        )
+        self._conn.commit()
+
+    def mark_pushed(self, url: str) -> None:
+        self.mark_pushed_many([url])
+
+    def stats(self) -> dict:
+        cur = self._conn.execute("SELECT status, COUNT(*) AS n FROM articles GROUP BY status")
+        data = {row["status"]: row["n"] for row in cur.fetchall()}
+        return {"pending": data.get("pending", 0), "pushed": data.get("pushed", 0)}
+
+    @staticmethod
+    def _row_to_dict(row) -> dict:
+        item = dict(row)
+        try:
+            item["info"] = json.loads(item.get("payload") or "{}")
+        except ValueError:
+            item["info"] = {}
+        return item

@@ -1,0 +1,23 @@
+# 虚拟环境（各自独立，不进版本库）
+.venv/
+
+# 密钥：只提交 .env.example
+.env
+
+# 运行产物
+data/
+logs/
+*.db
+*.db.bak-*
+
+# 缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# 工具运行态（自动任务记忆等本机数据，不入库）
+.workbuddy/
