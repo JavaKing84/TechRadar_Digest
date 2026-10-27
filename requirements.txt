@@ -17,4 +17,9 @@ openai>=1.30
 PyYAML>=6.0
 python-dotenv>=1.0
 beautifulsoup4>=4.12
+# [lxml 必须显式写] 代码用 BeautifulSoup(html, "lxml")，但本机 venv 里 lxml
+#   是别的东西顺带装的，干净镜像里没有 —— 容器内实测报
+#   "Couldn't find a tree builder with the features you requested: lxml"，
+#   所有文章页解析失败、整轮采集抛 CrawlError。pyproject 也一并补上了。
+lxml>=5.0
 requests>=2.31
