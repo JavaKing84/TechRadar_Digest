@@ -8,7 +8,7 @@ TechCrunch / MIT TR / Wired / VentureBeat 抓正文 -> 中文标题 + 3~10 条�
 ## 快速开始
 
 ```bash
-cd D:/!pythonproject/feishu_bot/news_ai_science
+cd D:/!pythonproject/feishu_bot/TechRadar_Digest
 
 # 1. 环境（已就绪，无需重装）
 #    .venv 里已有 camoufox 0.5.8 / playwright / openai / pyyaml / dotenv / bs4
@@ -44,9 +44,27 @@ src/news_ai_science/
   pipeline/   runner
   storage/    SQLite
 tests/        离线单测，不联网
-docs/         architecture.md
+docs/         architecture.md（分层）  deployment.md（Docker 部署）
+.docker-assets/  Dockerfile 构建期用的离线内核安装脚本（zip 不进仓库）
 logs/         运行日志 + dry-run 卡片
 ```
+
+## Docker 部署（CentOS 7 / 内网）
+
+目标服务器 glibc 只有 2.17，Camoufox 要求 ≥ 2.28，所以走镜像而非宿主机直装。
+
+```bash
+# 1. 把 Linux 内核包放到 .docker-assets/camoufox-lin.zip（版本 156.0.1-beta.36，不进仓库）
+# 2. 构建
+docker build -t techradar-digest:1.0 .
+# 3. 跑一轮（.env 运行时注入，不烤进镜像）
+docker run --rm --env-file .env \
+  -v "$PWD/data:/app/data" -v "$PWD/logs:/app/logs" \
+  techradar-digest:1.0 --once
+```
+
+内核包的命名规则、离线安装原理、cron 定时、代理与排错，全部见
+[`docs/deployment.md`](docs/deployment.md)。
 
 ## 注意
 
