@@ -126,8 +126,9 @@ RUN pip install -r requirements.txt
 # [fpgen 指纹模型也必须离线预置]
 #   实测：容器里第一次 Camoufox(...) 会去 GitHub 下载 1.5 MB 的 model-2/2026，
 #   服务器出不了 GitHub 时直接抛 FpgenModelError，浏览器起不来。
-#   这个包只有 1.5 MB，随仓库带过来，构建期离线装好（含 sha256 校验）。
-COPY .docker-assets/install_fpgen_model.py .docker-assets/fpgen-model-release.zip /opt/assets/
+#   fpgen-model-release.zip 已不随仓库分发（2026-10-28 移除）；若本地
+#   .docker-assets/ 下有这个包就离线安装，否则构建期联网获取（仅构建机需外网）。
+COPY .docker-assets/install_fpgen_model.py /opt/assets/
 RUN set -eux; \
     if [ -f /opt/assets/fpgen-model-release.zip ]; then \
         python /opt/assets/install_fpgen_model.py /opt/assets/fpgen-model-release.zip; \
