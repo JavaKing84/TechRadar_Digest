@@ -48,7 +48,9 @@
 | `requirements.txt` | 镜像内依赖清单（由 pyproject 派生） | 是 |
 | `.dockerignore` | 裁剪上下文，排除 `.venv/` `.git/` `data/` `logs/` `.env` | 是 |
 | `.docker-assets/install_offline_kernel.py` | 构建期把官方内核 zip 摆成 SDK 认识的布局，实现零联网装核 | 是 |
-| `.docker-assets/camoufox-<ver>-lin.x86_64.zip` | 官方 Linux 内核包，约 1.3 GB，**需自己放** | 否（`.gitignore` 已排除） |
+| `.docker-assets/install_fpgen_model.py` | 构建期离线装 fpgen 指纹模型（1.5 MB，Camoufox 首次启动否则要去 GitHub 下） | 是 |
+| `.docker-assets/fpgen-model-release.zip` | 指纹模型包，1.5 MB，**已入库**，服务器直接 clone 就有 | 是 |
+| `.docker-assets/camoufox-<ver>-lin.x86_64.zip` | 官方 Linux 内核包，约 1.3 GB，**需自己传** | 否（`.gitignore` 只排除 `camoufox-*.zip`） |
 | `.env` | 真实密钥，**只在宿主机**，不进 git、不进镜像 | 否 |
 
 ---
@@ -72,7 +74,37 @@ camoufox-lin.zip                              ← 也支持（脚本回退读 SD
 
 **如果两边都拿不到内核（服务器出不了 GitHub、本地也下不来）**，只有一条路：
 在有网的机器上构建好镜像，`docker save` 成 tar，用 MobaXterm 的 SFTP 上传，再 `docker load`。
-镜像约 4~5 GB，传输耗时按校园网上行带宽估算。
+镜像实测约 4~5 GB，传输耗时按校园网上行带宽估算。
+
+### 官方包地址（可直接用 curl 下载）
+
+```
+https://github.com/daijro/camoufox/releases/download/v156.0.1-beta.36/camoufox-156.0.1-beta.36-lin.x86_64.zip
+```
+
+大小 **1,294,875,941 字节**（约 1.21 GB）。国内直连实测约 65 KB/s 且会中途停滞，
+建议加加速前缀：
+
+```bash
+# 单线程（会限速，约 60~300 KB/s）
+curl -L -C - --retry 30 --retry-all-errors \
+  -o camoufox-156.0.1-beta.36-lin.x86_64.zip \
+  "https://ghfast.top/https://github.com/daijro/camoufox/releases/download/v156.0.1-beta.36/camoufox-156.0.1-beta.36-lin.x86_64.zip"
+```
+
+构建时也可以直接指定镜像地址，不必手工下：
+
+```bash
+sudo docker compose build \
+  --build-arg CAMOUFOX_KERNEL_URL="https://ghfast.top/https://github.com/daijro/camoufox/releases/download/v156.0.1-beta.36/camoufox-156.0.1-beta.36-lin.x86_64.zip"
+```
+
+### ⚠ 不要用 `python -m camoufox fetch`
+
+实测（本机）：该命令在下载停滞/失败时**以 0 退出**，`docker build` 显示成功，
+但镜像里 `/root/.cache/camoufox` 只有一个 8 KB 的 `repo_cache.json`，没有任何浏览器本体，
+上线后才在运行时炸。本 Dockerfile 已改为 `curl -fL`（HTTP 非 2xx 即失败）+
+安装后 `test -x .../camoufox` 强校验，**内核缺失会让构建直接失败**，而不是产出空壳镜像。
 
 ---
 
@@ -95,20 +127,55 @@ sudo git clone https://gitee.com/ma-lichen/TechRadar_Digest.git
 
 私有仓库才需要账号密码；公开仓库直接 clone。
 
-### 2. 上传 `.env`（**必须做，否则容器起不来**）
+### 2. 上传两个文件：`.env` 与浏览器内核包（**都必须做**）
 
-`.env` 被 `.gitignore` 排除，clone 下来是没有的。在**本机**另开一个 MobaXterm 标签页：
+git 里只有源码，这两个都被 `.gitignore` 排除，clone 下来是没有的。
+
+#### (a) `.env` —— 没有它容器起不来
+
+在**本机**另开一个 MobaXterm 标签页：
 
 ```bash
 # 本机执行（Windows 可用 MobaXterm 的 SFTP 面板直接拖拽）
 scp -P 22 "D:/!pythonproject/feishu_bot/TechRadar_Digest/.env" 用户名@10.191.44.66:/var/www/TechRadar_Digest/.env
 ```
 
-并把密钥文件权限收紧：
+传完在服务器上把权限收紧：
 
 ```bash
 sudo chmod 600 /var/www/TechRadar_Digest/.env
 ```
+
+#### (b) 浏览器内核包 1.23 GB —— 没有它镜像里就没浏览器
+
+服务器大概率出不了 GitHub。不传这个包，构建会退化成构建期下载，**要么卡 5 小时，要么失败**。
+
+```bash
+# 本机执行。文件名必须保持原样（构建脚本按 camoufox-*-lin*.zip 匹配）
+scp -P 22 \
+  "D:/!pythonproject/feishu_bot/TechRadar_Digest/.docker-assets/camoufox-156.0.1-beta.36-lin.x86_64.zip" \
+  用户名@10.191.44.66:/var/www/TechRadar_Digest/.docker-assets/
+```
+
+传完在服务器上核对字节数，**必须正好是 `1294875941`**。不一致说明传输中断：
+
+```bash
+ls -l /var/www/TechRadar_Digest/.docker-assets/*.zip
+# 期望：-rw-r--r-- 1 user user 1294875941 ... camoufox-156.0.1-beta.36-lin.x86_64.zip
+```
+
+不一致时的续传办法（比 `scp` 重新传整个包省时间）：
+
+```bash
+# 本机执行；rsync 支持断点续传
+rsync -avP --partial \
+  "D:/!pythonproject/feishu_bot/TechRadar_Digest/.docker-assets/camoufox-156.0.1-beta.36-lin.x86_64.zip" \
+  用户名@10.191.44.66:/var/www/TechRadar_Digest/.docker-assets/
+```
+
+> 1.23 GB 建议用 `scp`/`rsync`，不要用 MobaXterm 左侧 SFTP 面板拖拽（大文件容易卡死且看不到进度）。
+> 校园网上行一般 2~10 MB/s，预计 2~10 分钟。
+> 如果服务器确实能直连 GitHub（先测 `curl -I https://github.com`），这一步可以跳过。
 
 ### 3. 检查 docker / compose 版本
 
@@ -127,7 +194,8 @@ docker-compose --version
   ```
   国内下不动 GitHub 时可换成镜像地址或在能联网的机器下好再传。
 - 只有 v1（`docker-compose`）时，把下面所有 `docker compose` 换成 `docker-compose` 即可，
-  compose 文件里的 `version: "3.3"` 就是为兼容 v1 留的。
+  compose 文件里的 `version: "2.4"` 就是为兼容 v1 留的（用 3.x 的话 `mem_limit`、
+  `shm_size` 会被判为非法配置直接报错）。
 
 ### 4. 构建并启动
 
@@ -155,6 +223,29 @@ df -h /var
 sudo docker compose ps                 # 状态应为 Up
 sudo docker compose logs -f            # 实时日志，看到「---- 开始一轮 ----」即正常
 ```
+
+先做一次**出网自检**（容器要同时访问新闻站、飞书、大模型，任一不通都会"看起来在跑但发不出去"）：
+
+```bash
+sudo docker compose exec news-ai-science python - <<'PY'
+import os, urllib.request, ssl
+ctx = ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
+targets = {
+  "飞书 webhook": os.environ.get("FEISHU_WEBHOOK_URL","").split("/hook/")[0] or "https://open.feishu.cn",
+  "大模型":       os.environ.get("LLM_BASE_URL","").rsplit("/v1",1)[0],
+  "新闻站":       "https://www.technologyreview.com",
+}
+for name, url in targets.items():
+    try:
+        req = urllib.request.Request(url, method="GET", headers={"User-Agent":"curl/8"})
+        code = urllib.request.urlopen(req, timeout=10, context=ctx).status
+        print(f"[OK]   {name:12} {code}  {url}")
+    except Exception as e:
+        print(f"[FAIL] {name:12} {type(e).__name__}: {e}  {url}")
+PY
+```
+
+全绿再往下走；有 FAIL 先解决网络/代理（见第七节）。
 
 日志正常长相（参考本机 dry-run 实测）：
 

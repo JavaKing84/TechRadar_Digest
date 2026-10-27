@@ -58,6 +58,29 @@ def parse_ver(zip_name: str) -> tuple[str, str]:
     return version, build
 
 
+def restore_exec_bits(root: Path) -> int:
+    """补回可执行权限。
+
+    [为什么必须做] Python 的 zipfile.extractall 完全不保留 zip 里的 POSIX 权限位，
+    解出来的 camoufox-bin 是 0644，Playwright 启动时报
+        spawn .../camoufox-bin EACCES
+    真实故障，实测复现。解决办法是扫一遍文件头：ELF 或带 #! 的都 chmod 755。
+    """
+    fixed = 0
+    for p in root.rglob("*"):
+        if not p.is_file() or p.is_symlink():
+            continue
+        try:
+            with open(p, "rb") as f:
+                magic = f.read(4)
+        except OSError:
+            continue
+        if magic[:4] == b"\x7fELF" or magic[:2] == b"#!":
+            p.chmod(0o755)
+            fixed += 1
+    return fixed
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print(__doc__)
@@ -86,6 +109,9 @@ def main() -> int:
         for item in src.iterdir():
             shutil.move(str(item), str(target / item.name))
 
+    n = restore_exec_bits(target)
+    print(f"[OK] 已补回 {n} 个可执行文件的权限位")
+
     # zip 里不带 version.json，必须自己写，否则 SDK 判定为"未安装"
     (target / "version.json").write_text(
         json.dumps(
@@ -100,9 +126,13 @@ def main() -> int:
     )
     (INSTALL_DIR / ".0.5_FLAG").touch()
 
-    exe = target / "camoufox"
-    if exe.exists():
-        exe.chmod(0o755)
+    # 双保险：关键的浏览器入口必须可执行
+    for name in ("camoufox", "camoufox-bin"):
+        exe = target / name
+        if exe.exists():
+            exe.chmod(0o755)
+        else:
+            raise SystemExit(f"[FAIL] 内核包不完整，缺少 {name}：{target}")
 
     print(f"[OK] 内核已离线安装：{target}")
     print(f"[OK] active_version = browsers/{REPO}/{full}")

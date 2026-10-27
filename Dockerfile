@@ -84,9 +84,10 @@ RUN set -eux; \
         echo "==> 使用离线内核包：$zipf"; \
     fi; \
     python /opt/assets/install_offline_kernel.py "$zipf"; \
-    chmod +x /root/.cache/camoufox/browsers/official/*/camoufox; \
+    chmod +x /root/.cache/camoufox/browsers/official/*/camoufox \
+             /root/.cache/camoufox/browsers/official/*/camoufox-bin; \
     du -sh /root/.cache/camoufox; \
-    test -x /root/.cache/camoufox/browsers/official/*/camoufox
+    test -x /root/.cache/camoufox/browsers/official/*/camoufox-bin
 
 # ---------- 阶段 2：运行镜像 ----------
 FROM ${BASE_IMAGE}
@@ -121,6 +122,19 @@ WORKDIR /app
 # 先装依赖再拷代码：只改业务代码时这一层缓存仍然有效
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
+
+# [fpgen 指纹模型也必须离线预置]
+#   实测：容器里第一次 Camoufox(...) 会去 GitHub 下载 1.5 MB 的 model-2/2026，
+#   服务器出不了 GitHub 时直接抛 FpgenModelError，浏览器起不来。
+#   这个包只有 1.5 MB，随仓库带过来，构建期离线装好（含 sha256 校验）。
+COPY .docker-assets/install_fpgen_model.py .docker-assets/fpgen-model-release.zip /opt/assets/
+RUN set -eux; \
+    if [ -f /opt/assets/fpgen-model-release.zip ]; then \
+        python /opt/assets/install_fpgen_model.py /opt/assets/fpgen-model-release.zip; \
+    else \
+        echo "==> 无离线模型包，构建期联网获取"; \
+        python -c "from camoufox.fpgen_model import ensure_fpgen_model as e; e()"; \
+    fi
 
 COPY main.py ./
 COPY config ./config
