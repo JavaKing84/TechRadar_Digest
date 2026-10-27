@@ -1,0 +1,58 @@
+# ============================================================================
+# TechRadar_Digest（news_ai_science）容器编排
+#
+# [常用命令]
+#   docker compose up -d --build      # 构建并后台启动
+#   docker compose logs -f            # 看实时日志
+#   docker compose ps                 # 看容器状态
+#   docker compose run --rm news-ai-science python main.py --once    # 只跑一轮
+#   docker compose run --rm news-ai-science python main.py --stats   # 查队列
+#   docker compose down               # 停止并删除容器（数据在 ./data 不受影响）
+#
+# [为什么用 2.4 而不是 3.x]
+#   compose 文件 3.x 移除了 mem_limit / shm_size 这类资源限制（改由
+#   deploy.resources 表达，而 deploy 在老版 docker-compose v1 上又被忽略）。
+#   2.4 同时被 docker-compose v1（≥1.10）与 docker compose v2 支持，
+#   是 CentOS 7 这种老环境下最省心的选择：
+#   用 v1 不会报 "Unsupported config option"，用 v2 只会打印一条
+#   "version is obsolete" 警告，都不影响运行。
+# ============================================================================
+version: "2.4"
+
+services:
+  news-ai-science:
+    build:
+      context: .
+      args:
+        # 拉不到 Docker Hub 时的兜底：用环境变量或直接改这里的默认值
+        BASE_IMAGE: "${BASE_IMAGE:-docker.m.daocloud.io/library/python:3.10-slim-bullseye}"
+    image: news_ai_science:1.0
+    container_name: news_ai_science
+    restart: unless-stopped
+
+    # 密钥只放在宿主机的 .env 里，不进镜像、不进 git
+    env_file:
+      - .env
+
+    environment:
+      TZ: Asia/Shanghai
+      # 两轮之间的间隔（秒）。默认 12 小时；配 cron 习惯的话可改成 86400
+      RUN_INTERVAL_SECONDS: "43200"
+      # 服务器必须经代理才能出网时，取消下行注释并填代理地址
+      # （config.yaml 里 crawl.bypass_proxy=false，即允许走环境代理）
+      # HTTPS_PROXY: "http://10.191.44.1:7890"
+      # HTTP_PROXY: "http://10.191.44.1:7890"
+
+    volumes:
+      # 真正的持久化：SQLite 历史库（去重靠它）与日志
+      - ./data:/app/data
+      - ./logs:/app/logs
+      # 预留目录：当前代码不往 output/ 写任何东西（持久化只用 data/ 与 logs/），
+      # 挂在这里只是为了和统一规范保持一致，留着不影响运行
+      - ./output:/app/output
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

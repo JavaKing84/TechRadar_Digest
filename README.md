@@ -52,18 +52,27 @@ logs/         运行日志 + dry-run 卡片
 ## Docker 部署（CentOS 7 / 内网）
 
 目标服务器 glibc 只有 2.17，Camoufox 要求 ≥ 2.28，所以走镜像而非宿主机直装。
+镜像基于 `python:3.10-slim-bullseye`（Python 3.10.18 + glibc 2.31，实测）。
 
 ```bash
-# 1. 把 Linux 内核包放到 .docker-assets/camoufox-lin.zip（版本 156.0.1-beta.36，不进仓库）
-# 2. 构建
-docker build -t techradar-digest:1.0 .
-# 3. 跑一轮（.env 运行时注入，不烤进镜像）
-docker run --rm --env-file .env \
-  -v "$PWD/data:/app/data" -v "$PWD/logs:/app/logs" \
-  techradar-digest:1.0 --once
+# 1. 构建（首次会装系统库 + 拉浏览器内核，10~30 分钟属正常）
+docker compose up -d --build
+
+# 2. 看日志
+docker compose logs -f
+
+# 3. 只跑一轮 / 查队列（不进常驻循环）
+docker compose run --rm news-ai-science python main.py --once --dry-run
+docker compose run --rm news-ai-science python main.py --stats
 ```
 
-内核包的命名规则、离线安装原理、cron 定时、代理与排错，全部见
+前置条件只有两个：
+
+- **`.env` 必须在项目根目录**（被 `.gitignore` 排除，clone 下来没有，需单独传）
+- **浏览器内核**：构建期若无 `.docker-assets/camoufox-*-lin*.zip`，会联网走
+  `python -m camoufox fetch`；服务器出不了 GitHub 时必须放离线包（约 1.3 GB，不进仓库）
+
+命名规则、离线安装原理、服务器端逐步操作、代理与排错，全部见
 [`docs/deployment.md`](docs/deployment.md)。
 
 ## 注意

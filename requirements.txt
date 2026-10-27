@@ -1,0 +1,20 @@
+# =====================================================================
+# [文件] requirements.txt
+# [职责] Docker 镜像内的依赖清单（由 pyproject.toml 的 dependencies 派生）。
+# [为什么需要它] pyproject 里写着 requires-python = ">=3.11"，而部署镜像
+#   按老师要求用 Python 3.10；直接 `pip install .` 会被元数据挡下
+#   （"requires a different Python: 3.10.x not in '>=3.11'"）。
+#   改用 `pip install -r requirements.txt` 装依赖、代码走 main.py 的
+#   sys.path 注入，即可在 3.10 下正常运行。若改回 3.11 基础镜像，
+#   requirements.txt 与 `pip install .` 两者都可以。
+# [版本策略] camoufox 必须与 Dockerfile 的 CAMOUFOX_VERSION 及浏览器内核
+#   版本严格对应（SDK 0.5.8 -> 内核 156.0.1-beta.36），所以钉死；
+#   playwright 被 camoufox 约束在 <1.63，这里显式写出来避免解析歧义。
+# =====================================================================
+camoufox==0.5.8
+playwright>=1.40,<1.63
+openai>=1.30
+PyYAML>=6.0
+python-dotenv>=1.0
+beautifulsoup4>=4.12
+requests>=2.31

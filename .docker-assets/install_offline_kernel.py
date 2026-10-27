@@ -7,6 +7,8 @@
     多版本布局，让 Camoufox 认为"已经装好了"，从而完全不联网。
 
 [调用] python install_offline_kernel.py /path/to/camoufox-156.0.1-beta.36-lin.x86_64.zip
+       文件名不规范时（如 camoufox-lin.zip）回退到 SDK 自带的 browser-pin.json
+       取版本，因此两种命名都能用。
 
 [还原出的布局，与 `camoufox fetch` 完全一致]
     <cache>/.0.5_FLAG                              兼容标记，缺失会被 SDK 清空缓存
@@ -30,15 +32,29 @@ from pathlib import Path
 REPO = "official"  # 对应 browser-pin.json 里的 repo_name("Official") 的小写形式
 
 
+def pinned_version() -> tuple[str, str]:
+    """读取 SDK 自带的 browser-pin.json，拿到这一版库钉住的内核版本。"""
+    import camoufox
+
+    pin = Path(camoufox.__file__).parent / "browser-pin.json"
+    data = json.loads(pin.read_text(encoding="utf-8"))
+    version = str(data.get("version") or "")
+    build = str(data.get("build") or "")
+    if not version:
+        raise SystemExit(f"browser-pin.json 无 version 字段，无法确定内核版本：{pin}")
+    return version, build
+
+
 def parse_ver(zip_name: str) -> tuple[str, str]:
-    m = re.match(r"camoufox-(.+?)-lin\.", zip_name)
-    if not m:
-        raise SystemExit(
-            f"无法从文件名解析版本：{zip_name}\n"
-            "预期形如 camoufox-156.0.1-beta.36-lin.x86_64.zip"
-        )
-    full = m.group(1)
-    version, _, build = full.partition("-")
+    """从文件名解析 version / build；解析不到就用 SDK 钉住的版本兜底。"""
+    m = re.match(r"camoufox-(.+?)-lin[.\-]", zip_name)
+    if m:
+        full = m.group(1)
+        version, _, build = full.partition("-")
+        return version, build
+
+    version, build = pinned_version()
+    print(f"[warn] 文件名 '{zip_name}' 不含版本号，回退到 SDK 钉住的 {version}-{build}")
     return version, build
 
 

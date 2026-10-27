@@ -1,14 +1,40 @@
-﻿.venv/
+﻿# [构建上下文裁剪]
+# 目的：把镜像构建上下文从 ~800MB（含 .venv）压到几 MB，构建更快、也不会
+# 把本机虚拟环境和密钥塞进镜像层。注意 .docker-assets/ 必须保留（内核安装脚本）。
+.venv/
+venv/
+env/
+
+# 密钥：绝不进镜像
+.env
+.env.*
+!.env.example
+
 .git/
-**/__pycache__/
-**/*.pyc
-.pytest_cache/
-.ruff_cache/
+.gitignore
+.gitattributes
+
+# 运行产物：由宿主目录挂载，不打进镜像
 data/
 logs/
-.env
-docs/
+output/
+
+# Python 缓存
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 运行期用不到的开发文件
 tests/
+docs/
+tools/
+*.md
 Makefile
+
+# 构建文件自身
 Dockerfile
+docker-compose.yml
 .dockerignore
