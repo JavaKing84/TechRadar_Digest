@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""离线安装 Camoufox 的 Linux 浏览器内核包。
+
+[为什么需要] 目标环境（镜像构建期或 CentOS 服务器）访问不了 GitHub，但
+    `python -m camoufox fetch` 必须联网。本脚本把官方 zip 摆成 SDK 期望的
+    多版本布局，让 Camoufox 认为"已经装好了"，从而完全不联网。
+
+[调用] python install_offline_kernel.py /path/to/camoufox-156.0.1-beta.36-lin.x86_64.zip
+
+[还原出的布局，与 `camoufox fetch` 完全一致]
+    <cache>/.0.5_FLAG                              兼容标记，缺失会被 SDK 清空缓存
+    <cache>/config.json                            {"active_version": "browsers/official/<ver>"}
+    <cache>/browsers/official/<ver>/...            浏览器文件
+    <cache>/browsers/official/<ver>/version.json   version / build / interface 三字段
+
+  注意 <cache> 由 SDK 自己算：Linux 是 ~/.cache/camoufox，
+  Windows 是 %LOCALAPPDATA%\\camoufox\\camoufox\\Cache。不要写死路径。
+"""
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+
+REPO = "official"  # 对应 browser-pin.json 里的 repo_name("Official") 的小写形式
+
+
+def parse_ver(zip_name: str) -> tuple[str, str]:
+    m = re.match(r"camoufox-(.+?)-lin\.", zip_name)
+    if not m:
+        raise SystemExit(
+            f"无法从文件名解析版本：{zip_name}\n"
+            "预期形如 camoufox-156.0.1-beta.36-lin.x86_64.zip"
+        )
+    full = m.group(1)
+    version, _, build = full.partition("-")
+    return version, build
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print(__doc__)
+        return 2
+
+    zpath = Path(sys.argv[1]).resolve()
+    if not zpath.is_file():
+        raise SystemExit(f"内核包不存在：{zpath}")
+
+    # SDK 自己决定缓存根目录，避免 Linux/Windows 路径差异
+    from camoufox.pkgman import INSTALL_DIR
+
+    version, build = parse_ver(zpath.name)
+    full = f"{version}-{build}" if build else version
+    target = INSTALL_DIR / "browsers" / REPO / full
+
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with zipfile.ZipFile(zpath) as z:
+            z.extractall(tmp)
+        entries = list(Path(tmp).iterdir())
+        src = entries[0] if len(entries) == 1 and entries[0].is_dir() else Path(tmp)
+        for item in src.iterdir():
+            shutil.move(str(item), str(target / item.name))
+
+    # zip 里不带 version.json，必须自己写，否则 SDK 判定为"未安装"
+    (target / "version.json").write_text(
+        json.dumps(
+            {"version": version, "build": build, "interface": 1, "prerelease": bool(build)},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (INSTALL_DIR / "config.json").write_text(
+        json.dumps({"active_version": f"browsers/{REPO}/{full}"}, indent=2),
+        encoding="utf-8",
+    )
+    (INSTALL_DIR / ".0.5_FLAG").touch()
+
+    exe = target / "camoufox"
+    if exe.exists():
+        exe.chmod(0o755)
+
+    print(f"[OK] 内核已离线安装：{target}")
+    print(f"[OK] active_version = browsers/{REPO}/{full}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

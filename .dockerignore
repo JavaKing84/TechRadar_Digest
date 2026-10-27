@@ -1,0 +1,14 @@
+﻿.venv/
+.git/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.ruff_cache/
+data/
+logs/
+.env
+docs/
+tests/
+Makefile
+Dockerfile
+.dockerignore
