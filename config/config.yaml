@@ -39,7 +39,8 @@ llm:
   api_key: ""
   model: ""
   temperature: 0.2
-  max_tokens: 6000        # 该模型会先吃掉 reasoning_tokens，给少会把正文挤成空串（实测 3500 仍会空）
+  max_tokens: 8000        # 全文翻译的输出长度远大于要点摘要：4000 字英文正文
+                          # 约产出 2000 字中文译文；6000 会在长文上被截断
   timeout: 120
   retries: 1
   # [关键] 关闭思考模式

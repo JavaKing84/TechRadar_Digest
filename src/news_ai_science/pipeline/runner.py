@@ -109,6 +109,13 @@ def collect(cfg: dict, store: NewsStore, client: LLMClient | None) -> list[dict]
         info = translate(art, client)
         payload = {
             "title_zh": info.get("title_zh") or art.title,
+            # [表面] 卡片右侧摘要（≤100 字）
+            # [本质] 与 full_translation 一起入库：轮换推送时无需再调 LLM，
+            #        历史条目也能直接渲染成新版卡片
+            "summary": info.get("summary") or "",
+            "full_translation": info.get("full_translation") or "",
+            # 旧字段保留：改造前入库的记录只有 summaries，
+            # 卡片层用它做"无译文"时的降级展示
             "summaries": info.get("summaries") or [],
             "image_key": "",
             "cover_image": art.cover_image,
@@ -133,10 +140,11 @@ def collect(cfg: dict, store: NewsStore, client: LLMClient | None) -> list[dict]
         store.save(art.url, payload["title_zh"], art.source_name, payload)
         records.append(record)
         logger.info(
-            "[News] 备好 %d/%d: %s | 摘要 %d 条 | 配图 %s | 兜底 %s | slug=%s",
+            "[News] 备好 %d/%d: %s | 摘要 %d 字 | 译文 %d 字 | 配图 %s | 兜底 %s | slug=%s",
             index, len(fresh),
             payload["title_zh"][:36],
-            len(payload["summaries"]),
+            len(payload["summary"]),
+            len(payload["full_translation"]),
             "有" if payload["image_key"] else "无",
             "是" if payload["is_fallback"] else "否",
             url_slug(art.url),
