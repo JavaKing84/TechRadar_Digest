@@ -36,8 +36,10 @@ services:
 
     environment:
       TZ: Asia/Shanghai
-      # 两轮之间的间隔（秒）。默认 12 小时；配 cron 习惯的话可改成 86400
-      RUN_INTERVAL_SECONDS: "43200"
+      # [调度] 容器不自己 sleep 轮询，由宿主机 cron 每天 8 点触发一轮：
+      #   0 8 * * * docker exec news_ai_science python main.py --once \
+      #             >> /var/log/techradar.log 2>&1
+      # 旧的 RUN_INTERVAL_SECONDS 已废弃（那是"假定时任务"的残余）
       # 服务器必须经代理才能出网时，取消下行注释并填代理地址
       # （config.yaml 里 crawl.bypass_proxy=false，即允许走环境代理）
       # HTTPS_PROXY: "http://10.191.44.1:7890"

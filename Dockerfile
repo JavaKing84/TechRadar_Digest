@@ -148,9 +148,20 @@ COPY --from=kernel /root/.cache/camoufox /root/.cache/camoufox
 RUN mkdir -p /app/data /app/logs
 
 # [本项目是"一次性批处理"，不是常驻服务]
-#   容器内跑 while：跑一轮 -> 睡 RUN_INTERVAL_SECONDS -> 再跑
-#   因此 restart: unless-stopped 才有意义（进程意外退出会被拉起，
-#   而不是变成"秒退-重启"的死循环去刷群消息）。
-#   只想跑一次就退出：
-#     docker compose run --rm news-ai-science python main.py --once
-CMD ["sh", "-c", "while true; do echo \"[$(date '+%F %T')] ---- 开始一轮 ----\"; python main.py --once || echo '[warn] 本轮失败，等待下一轮'; sleep ${RUN_INTERVAL_SECONDS:-43200}; done"]
+#   容器只提供运行环境，不负责定时：调度由宿主机 cron 完成
+#     crontab: 0 8 * * *  docker exec news_ai_science python main.py --once
+#
+#   [为什么不再用 while sleep] 旧 CMD 是
+#     while true; do python main.py --once; sleep ${RUN_INTERVAL_SECONDS}; done
+#   这是"假定时任务"，有三个硬伤：
+#     ① 容器一重启就立刻跑一轮 —— 重启等于推送，与"每天 8 点"完全无关；
+#     ② sleep 期间进程常驻占内存却什么都不做；
+#     ③ 计时器以"上次启动"为原点，永远校准不到固定的 8:00。
+#   真定时任务必须由宿主机 cron 触发，容器只提供 Python 运行时。
+#
+#   [为什么是 sleep infinity 而不是"跑完就退出"] docker exec 要求容器处于
+#     running 状态；执行完即退出的容器会被 cron 报 "is not running"。
+#     若要保持"跑完即退"，cron 必须改用 docker run --rm，而非 docker exec。
+#     另外 restart: unless-stopped 会把"跑完退出"的容器反复拉起，形成重启风暴。
+CMD ["sleep", "infinity"]
+
