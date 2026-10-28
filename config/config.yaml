@@ -60,6 +60,8 @@ crawl:
   require_image: true     # 铁律：没有配图的新闻直接跳过，绝不用乱图凑
   bypass_proxy: false     # 本机直连被封，走环境代理才通；直连可用的机器才能开
   min_body_chars: 300     # 正文短于这个数视为抽取失败，丢弃该篇
+  retries: 2              # 单页导航失败重试次数（1.5s、3s 指数退避 + 抖动）
+  request_interval: 1.2   # 同一站点两次请求的最小间隔（秒，含 ±25% 抖动）
 
 # ---- 新闻源 ----
 # [说明] 源清单已拆到 config/sources.yaml（改源不用碰本文件），

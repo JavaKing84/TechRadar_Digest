@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import random
 import re
 import time
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urldefrag, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -30,6 +31,18 @@ logger = get_logger(__name__)
 
 PAGE_TIMEOUT_MS = 45000
 LIST_WAIT_MS = 25000
+
+# [表面] 导航失败时重试几次、每次间隔多久
+# [本质] 新闻站偶发 502/连接重置/首包超时，重试一次就能过；重试太多
+#        会把「站点已下线」拖成整轮超时，所以默认 2 次、指数退避
+# [后果] 抖动被吸收，真挂了也不会无限拖
+DEFAULT_RETRIES = 2
+RETRY_BASE_DELAY = 1.5
+
+# [表面] 同一站点两次请求之间的最小间隔（秒）
+# [本质] 连续快速请求是触发限流/封 IP 的主要原因；1.2 秒 ≈ 50 次/分钟，
+#        远低于常见站点的阈值，一轮 6 篇多花几秒但换来稳定性
+DEFAULT_REQUEST_INTERVAL = 1.2
 
 PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 
@@ -101,6 +114,97 @@ def _bypass_env_proxy():
         if had_no_proxy is not None:
             os.environ["NO_PROXY"] = had_no_proxy
         os.environ.update(saved)
+
+
+# =====================================================================
+# 链接规范化 / 重试 / 限速
+# =====================================================================
+
+# [表面] 这些查询参数不改变「是哪篇文章」
+# [本质] 列表页会挂 utm_*/fbclid/spm 之类的追踪参数，同一篇文章因此产生
+#        多个不同 URL；不归一化就会在库里存成两条、同一轮重复抓两次
+TRACKING_PREFIXES = ("utm_", "pk_", "mtm_")
+TRACKING_KEYS = frozenset(
+    {"fbclid", "gclid", "msclkid", "yclid", "mc_cid", "mc_eid", "ref", "referrer",
+     "spm", "share_token", "_hsenc", "_hsmi", "__twitter_impression", "cmpid"}
+)
+
+
+def canonical_url(url: str) -> str:
+    """
+    # [表面] 把 URL 归一化成「去重用的规范形式」
+    # [本质] 只做四件安全的事：丢 #片段、主机名和协议小写、去掉追踪参数、
+    #        去掉末尾多余的 /。绝不改路径本身（有些站点 /a 和 /a/ 是两篇）。
+    # [后果] 同一篇文章在列表页 / 分享链接 / 站内跳转里拿到的三种写法会合并成一条
+    """
+    if not url:
+        return ""
+    clean, _frag = urldefrag(url.strip())
+    parsed = urlparse(clean)
+    if not parsed.scheme or not parsed.netloc:
+        return clean
+
+    query_pairs = [
+        (k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+        if not k.lower().startswith(TRACKING_PREFIXES) and k.lower() not in TRACKING_KEYS
+    ]
+    path = parsed.path or "/"
+    if len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/")
+
+    return parsed._replace(
+        scheme=parsed.scheme.lower(),
+        netloc=parsed.netloc.lower(),
+        path=path,
+        query=urlencode(sorted(query_pairs)),
+    ).geturl()
+
+
+def _goto(page, url: str, label: str = "", attempts: int = DEFAULT_RETRIES) -> None:
+    """
+    # [表面] page.goto 的带重试版本
+    # [本质] 只重试「可恢复」的失败——超时、连接被重置、5xx 都是抖动；
+    #        地址本身写错（net::ERR_NAME_NOT_RESOLVED 之类）重试也没用，
+    #        但无法可靠区分，所以统一重试并靠次数上限兜底。
+    #        退避用 attempts 的指数（1.5s、3s…）加随机抖动，避免多源同时重试。
+    # [后果] 单页抖动不再直接计为「该源失败」，日志里能看到第几次重试成功
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            page.goto(url, timeout=PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
+            if attempt > 1:
+                logger.info("%s 第 %d 次尝试成功: %s", label or "[goto]", attempt, url[:70])
+            return
+        except Exception as exc:  # noqa: BLE001 - 需要吞掉所有导航异常以便重试
+            last_exc = exc
+            if attempt >= attempts:
+                break
+            delay = RETRY_BASE_DELAY * attempt + random.uniform(0, 0.6)
+            logger.warning(
+                "%s 导航失败（第 %d/%d 次），%.1fs 后重试: %s | %s",
+                label or "[goto]", attempt, attempts, delay, url[:70], exc,
+            )
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
+
+def _pace(last_at: float, interval: float) -> float:
+    """
+    # [表面] 保证同一站点两次请求至少隔 interval 秒，返回新的时间戳
+    # [本质] 限速必须是「两次请求之间」而不是「每个循环固定 sleep」：
+    #        请求本身耗时不固定，固定 sleep 会让快站变慢、慢站仍过密。
+    #        加 ±25% 抖动是为了不形成固定节奏（固定节奏本身也是特征）。
+    # [后果] 一轮多花几秒，换来不容易被判成机器访问
+    """
+    if interval <= 0:
+        return time.time()
+    gap = interval * random.uniform(0.75, 1.25)
+    wait = last_at + gap - time.time()
+    if wait > 0:
+        time.sleep(wait)
+    return time.time()
 
 
 # =====================================================================
@@ -365,7 +469,8 @@ def _cover_image(page) -> str:
 # =====================================================================
 
 def crawl_source(browser, source: dict, max_items: int, min_body_chars: int,
-                 seen=None) -> list[Article]:
+                 seen=None, retries: int = DEFAULT_RETRIES,
+                 interval: float = DEFAULT_REQUEST_INTERVAL) -> list[Article]:
     """
     # [表面] 抓一个源：列表页 -> 文章页 -> Article 列表
     # [本质] 列表页没取到链接就抛 CrawlError（由 crawl_all 记录并继续下一个源）；
@@ -380,11 +485,12 @@ def crawl_source(browser, source: dict, max_items: int, min_body_chars: int,
     list_url = str(source.get("url") or "")
     if not list_url:
         raise CrawlError(f"[{source_id}] 源配置缺少 url")
+    started = time.time()
 
     list_page = None
     try:
         list_page = browser.new_page()
-        list_page.goto(list_url, timeout=PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
+        _goto(list_page, list_url, f"[{source_id}] 列表页", retries)
         # [表面] 轮询等候选链接出现，而不是死等固定秒数
         # [本质] 列表页快慢差 10 倍以上（命中缓存 2 秒，冷启动 20 秒）
         # [后果] 快站 2 秒往下走，慢站最多等 LIST_WAIT_MS
@@ -409,10 +515,22 @@ def crawl_source(browser, source: dict, max_items: int, min_body_chars: int,
             except Exception:
                 pass
 
-    # [表面] 进正文页之前先按库里去重
-    # [本质] 正文页是最贵的一步（每篇 1~3 秒 + 一个页面）；
-    #        列表页里绝大多数链接都是老朋友，先剔掉再进详情页
-    # [后果] 一轮抓取只花在真正的新文章上，已发的连打开都不打开
+    # [表面] 先规范化链接并做「本轮内」去重，再按库里去重
+    # [本质] 同一条新闻常在不同源/不同栏目里出现，URL 只差 utm 参数；
+    #        只在单源内部去重挡不住跨源重复，必须在进正文页前用规范形式合并
+    # [后果] 同一篇只开一次正文页，省掉最贵的一步
+    normalized: list[str] = []
+    round_seen: set[str] = set()
+    for link in links:
+        canon = canonical_url(link)
+        if not canon or canon in round_seen:
+            continue
+        round_seen.add(canon)
+        normalized.append(canon)
+    if len(normalized) < len(links):
+        logger.info("[%s] 规范化去重 %d 个重复链接", source_id, len(links) - len(normalized))
+    links = normalized
+
     if seen is not None:
         before = len(links)
         links = [link for link in links if not seen(link)]
@@ -426,19 +544,24 @@ def crawl_source(browser, source: dict, max_items: int, min_body_chars: int,
             return []
 
     articles: list[Article] = []
+    last_request_at = time.time()
+    skipped_short = 0
     for link in links:
         if len(articles) >= max_items:
             break
+        # [表面] 每次进正文页之前先按站点间隔限速
+        last_request_at = _pace(last_request_at, interval)
         page = None
         try:
             page = browser.new_page()
-            page.goto(link, timeout=PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
+            _goto(page, link, f"[{source_id}] 正文页", retries)
             # [表面] 只等极短一段
             # [本质] 正文在首屏 HTML 里就有了，等再久也等不到更多文字
             # [后果] 单篇耗时从 ~20 秒降到个位数
             page.wait_for_timeout(400)
             body = extract_main_text(page.content())
             if len(body) < min_body_chars:
+                skipped_short += 1
                 logger.warning("[%s] 正文过短(%d 字)，丢弃该篇: %s", source_id, len(body), link)
                 continue
             title = _page_meta(page, source_name)
@@ -468,7 +591,14 @@ def crawl_source(browser, source: dict, max_items: int, min_body_chars: int,
                     page.close()
                 except Exception:
                     pass
-        time.sleep(0.3)
+
+    # [表面] 每个源收工时打一行汇总
+    # [本质] 排错时最想知道的是「这个源是没链接、还是链接都旧、还是正文抽不出」，
+    #        一行汇总比翻十几行零散日志快得多
+    logger.info(
+        "[%s] 源完成：候选 %d，入库 %d，正文过短 %d，耗时 %.1fs",
+        source_id, len(links), len(articles), skipped_short, time.time() - started,
+    )
     return articles
 
 
@@ -487,6 +617,11 @@ def crawl_all(cfg: dict, seen=None) -> tuple[list[Article], list[str]]:
     headless = bool(crawl_cfg.get("headless", True))
     bypass = bool(crawl_cfg.get("bypass_proxy", False))
     min_body = int(crawl_cfg.get("min_body_chars") or MIN_BODY_CHARS)
+    # [表面] 重试次数与站点限速都可以在 config.yaml 里调
+    # [本质] 不同网络环境（学校专线 / 家宽 / 容器内）能承受的节奏不同，
+    #        硬编码会让换环境就得改代码；配置项缺省时回落到模块常量
+    retries = int(crawl_cfg.get("retries", DEFAULT_RETRIES))
+    interval = float(crawl_cfg.get("request_interval", DEFAULT_REQUEST_INTERVAL))
 
     from camoufox import DefaultAddons
     from camoufox.sync_api import Camoufox
@@ -513,6 +648,17 @@ def crawl_all(cfg: dict, seen=None) -> tuple[list[Article], list[str]]:
             raise CrawlError(f"Camoufox 启动失败: {exc}") from exc
 
         with browser_ctx as browser:
+            round_started = time.time()
+            # [表面] 本轮已收的链接也参与去重
+            # [本质] 跨源重复（同一篇被两个源收录）只在源内部去重是挡不住的；
+            #        把本轮结果并进 seen 的判定里，第二篇就不会被抓第二次
+            collected: set[str] = set()
+
+            def round_seen(url: str) -> bool:
+                if canonical_url(url) in collected:
+                    return True
+                return bool(seen and seen(url))
+
             for source in sources:
                 if len(articles) >= total_limit:
                     break
@@ -520,14 +666,23 @@ def crawl_all(cfg: dict, seen=None) -> tuple[list[Article], list[str]]:
                 if remain <= 0:
                     break
                 try:
-                    got = crawl_source(browser, source, remain, min_body, seen)
+                    got = crawl_source(
+                        browser, source, remain, min_body, round_seen,
+                        retries=retries, interval=interval,
+                    )
                     articles.extend(got)
+                    collected.update(canonical_url(a.url) for a in got)
                 except CrawlError as exc:
                     logger.error("[Crawl] 源失败（继续下一个源）: %s", exc)
                     errors.append(str(exc))
                 except Exception as exc:
                     logger.error("[Crawl] 源异常（继续下一个源）: %s | %s", source.get("id"), exc)
                     errors.append(f"{source.get('id')}: {exc}")
+
+            logger.info(
+                "[Crawl] 本轮汇总：源 %d 个，成功入库 %d 篇，失败 %d 个，总耗时 %.1fs",
+                len(sources), len(articles), len(errors), time.time() - round_started,
+            )
 
     if not articles and errors:
         raise CrawlError("所有新闻源均未取到正文：" + " ; ".join(errors[:3]))
