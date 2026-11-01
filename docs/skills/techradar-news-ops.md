@@ -122,13 +122,27 @@ cd /var/www/TechRadar_news && docker compose up -d --no-build --force-recreate
 | 悬空镜像 | 14.4 GB / 6 个 | **不是本项目产物**（创建于 10-19 / 10-27 / 10-28），属其他项目的中间层 |
 | Build cache | ~6 GB | 清只影响构建速度，不删数据；要清用 `docker builder prune --filter until=24h`，别用 `--all` |
 
-## techcrunch 超时
+## techcrunch 超时（2026-11-01 已定性并修复）
 
-现象：服务器上列表页 `Page.goto` 45 秒超时，其余源正常，本机正常 → 属服务器出口网络，**不是代码问题**。
+**真因不是网络、不是反爬、不是浏览器指纹。** TechCrunch 页面 `<head>` 里同步加载
+`https://www.google.com/recaptcha/api.js` 与 `https://api.rlcdn.com/...`，这两个域名
+在服务器出口上是 TCP 黑洞（SYN 无响应，10 秒超时）。HTML 解析器停在那一行，
+`DOMContentLoaded` 永远不触发——所以 `wait_until="domcontentloaded"` 是永等一个不会来的事件，
+45 秒、15 秒结局相同。
 
-1. 先确认：`curl -o /dev/null -w '%{http_code} %{time_total}\n' -m 20 https://techcrunch.com`
-2. 若超时，给容器配代理（`docker-compose.yml` 已留 `HTTPS_PROXY` 注释槽位），改完 `--force-recreate`。
-3. **不要为此调大爬虫超时**——45 秒已是上限，再放长只是拖慢整轮，且会让单源故障蔓延到整轮。
+三步判定（缺一不可）：
+
+1. **网络层**：容器内 `urllib` 直取列表页，应 200 / 1 秒内 → 说明网络没问题
+2. **内容层**：`page.on("response")` 看主文档应 200；`page.content()` 应有 300 KB、几十个文章链接
+3. **卡点**：`document.readyState` 停在 `loading`，且有几个 `script` 请求永不返回 → 第三方脚本挂死
+
+修复（已入库 `314f5b9`）：`_goto` 改 `wait_until="commit"` + `_settle()` 软等待
+（`crawl.dom_settle_ms`，默认 3000，等不到只记 INFO、不算失败）；正文页从固定 sleep
+改成轮询抽取（`BODY_WAIT_MS`）。线上实测 techcrunch 22.6s 入库 3 篇，全轮 39.1s 零失败。
+
+> 教训：这类问题**不要靠调大 `page_timeout_ms`** 解决。它等的是一个永远不会来的事件，
+> 给多久都是白等；正确做法是把「页面有没有内容」和「第三方脚本有没有加载完」解耦。
+
 
 ## 排障速查
 
