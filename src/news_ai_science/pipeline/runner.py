@@ -43,6 +43,19 @@ DEFAULT_PER_RUN = 4
 # [后果] 有坏条目时仍能凑满 per_run，坏条目也不会白白占掉名额
 CANDIDATE_FACTOR = 3
 
+# [表面] 轮换推送时附在卡片上的红线提示
+# [本质] 抓取长期失败时，群里每天都在正常出卡，只是内容变旧——用户从卡片上
+#        分辨不出「今天没新闻」和「程序抓不到」。这句提示把静默失败变成可见失败
+# [后果] 看到这句话就知道该去查抓取源了，不用等别人发现内容不对
+ROTATE_NOTICE = "⚠️ 本轮无新文章入库，本次推送内容为历史轮换，请检查抓取源。"
+
+# [表面] 轮换池的两个上限（config 的 push.rotate_* 可覆盖）
+# [本质] 只靠 cooldown 挡不住长期失败：同一批老新闻会无限重推。
+#        7 天内的存货才值得推；同一篇最多重推 2 次
+# [后果] 池子用尽时宁可断更，也不推古董；上限调成 0 即关闭该限制
+DEFAULT_ROTATE_MAX_AGE_DAYS = 7
+DEFAULT_ROTATE_MAX_TIMES = 2
+
 
 def build_client(cfg: dict) -> LLMClient | None:
     """按配置造 LLM 客户端；任何一处缺失就返回 None，下游走兜底。"""
@@ -98,12 +111,19 @@ def _discard(store: NewsStore, art, reason: str, transient: bool = False) -> Non
         return
     logger.error("[News] 丢弃本条（非中文 / 翻译失败，不推送）: %s | %s",
                  art.title[:40], reason)
-    store.reject(
-        art.url,
-        truncate(art.title, TITLE_CHARS),
-        art.source_name,
-        {"rejected": True, "reason": reason, "is_fallback": False},
-    )
+    try:
+        store.reject(
+            art.url,
+            truncate(art.title, TITLE_CHARS),
+            art.source_name,
+            {"rejected": True, "reason": reason, "is_fallback": False},
+        )
+    except Exception as exc:
+        # [表面] 记不上 rejected 就算了，不能因此中断整轮
+        # [本质] 代价只是下一轮可能重抓这篇再失败一次（浪费一次 LLM 调用），
+        #        比整轮崩掉轻得多
+        # [后果] 库异常时退化成「不记录地丢弃」，流程继续
+        logger.warning("[News] 丢弃状态写库失败，本轮不记录: %s | %s", art.url[:70], exc)
 
 
 def collect(cfg: dict, store: NewsStore, client: LLMClient | None) -> list[dict]:
@@ -186,7 +206,17 @@ def collect(cfg: dict, store: NewsStore, client: LLMClient | None) -> list[dict]
                 logger.warning("[News] 配图上传失败，本条将无图推送: %s", art.url[:70])
             payload["image_key"] = img_key
 
-        store.save(art.url, payload["title_zh"], art.source_name, payload)
+        # [表面] 写库失败不中断整轮，跳过这一条
+        # [本质] 磁盘满 / 库文件损坏是这台机器的事，不是这条新闻的事；
+        #        入库失败还硬推出去，会被当成正常推送，下一轮又因 is_seen 认不出
+        #        而重抓重翻——宁可不推，也不要制造「推了但没记录」的幽灵条目
+        # [后果] 单条写库失败只丢一条，其余条目与推送流程照常
+        try:
+            store.save(art.url, payload["title_zh"], art.source_name, payload)
+        except Exception as exc:
+            logger.error("[News] 入库失败（磁盘满 / 库损坏？），本条跳过不推: %s | %s",
+                         art.url[:70], exc)
+            continue
         records.append({
             "url": art.url,
             "title": payload["title_zh"],
@@ -225,6 +255,14 @@ def push(cfg: dict, store: NewsStore, records: list[dict] | None,
     limit = per_run(cfg)
     from_rotate = False
 
+    # [表面] 轮换池的两道限制，可配置、可关闭
+    # [本质] 用 is None 判断而不是 `or`：0 是合法取值（关闭限制），
+    #        `x or 默认` 会把 0 悄悄换成 7 天——config 里 cooldown_hours: 0 踩过
+    age_raw = push_cfg.get("rotate_max_age_days")
+    times_raw = push_cfg.get("rotate_max_times")
+    rotate_age = DEFAULT_ROTATE_MAX_AGE_DAYS if age_raw is None else float(age_raw)
+    rotate_times = DEFAULT_ROTATE_MAX_TIMES if times_raw is None else int(times_raw)
+
     # [表面] 没传记录时，先把队列里的待推条目捞出来
     # [本质] --push-only 或本轮采集为空时 records 为空，直接走轮换会漏掉
     #        「pending 里明明有货」，报出「没有可推的新闻」这种自相矛盾的错
@@ -232,10 +270,14 @@ def push(cfg: dict, store: NewsStore, records: list[dict] | None,
     if not records:
         records = store.pick_pending_many(limit)
     if not records:
-        records = store.pick_rotate_many(limit, cooldown)
+        records = store.pick_rotate_many(limit, cooldown, rotate_age, rotate_times)
         from_rotate = bool(records)
     if not records:
-        logger.error("[News] 没有可推的新闻（队列空且冷却期内无历史可轮换）")
+        logger.error(
+            "[News] 没有可推的新闻（队列空，且无符合轮换条件的旧闻："
+            "入库 ≤ %.0f 天、同一篇重推 < %d 次）",
+            rotate_age, rotate_times,
+        )
         return {"ok": False, "reason": "no_record", "count": 0}
 
     # [表面] 上卡前的第二道闸：逐条做中文体检，非中文的一条都不许进卡
@@ -266,7 +308,12 @@ def push(cfg: dict, store: NewsStore, records: list[dict] | None,
         return {"ok": False, "reason": "all_rejected", "count": 0}
 
     records = records[:limit]
-    card = build_multi_news_card(records)
+    # [表面] 轮换推送时把红线提示直接钉进卡片（subtitle + 正文红字）
+    # [本质] 群里只发一条消息，不额外发文本——历史上的「卡片 + 纯文本」双发
+    #        在群里长得像重复推送，排查成本远高于收益
+    # [后果] 每轮仍然只有 1 条 interactive 卡片，非常规推送自带可见告警
+    notice = ROTATE_NOTICE if from_rotate else None
+    card = build_multi_news_card(records, notice=notice)
     titles = [str(record.get("title") or "") for record in records]
     summary_title = " / ".join(titles)[:120]
 
@@ -305,7 +352,25 @@ def push(cfg: dict, store: NewsStore, records: list[dict] | None,
         }
 
     if result.get("code") == 0:
-        store.mark_pushed_many([record["url"] for record in records])
+        urls = [record["url"] for record in records]
+        # [表面] 轮换成功累加 rotate_count，新文章的首次推送只刷时间
+        # [本质] 两者混用会让新文章也被计数，2 次之后新文章反而进不了轮换池
+        # [后果] 重推次数只在「旧闻重推」时增长，语义准确
+        try:
+            if from_rotate:
+                store.mark_rotated_many(urls)
+            else:
+                store.mark_pushed_many(urls)
+        except Exception as exc:
+            # [表面] 状态写不进去只报错，不改推送结果
+            # [本质] 卡片已经发出去了，此时返回失败没有意义；但库里状态没更新，
+            #        下一轮会把这批当待推/可轮换再捞一次 —— 重复推送比丢推更糟，
+            #        所以日志必须写明「需人工确认」
+            # [后果] 库故障时可能重复推送，但绝不会漏推，且日志可见
+            logger.error(
+                "[News] 推送已发出但状态写库失败（下一轮可能重复推送，需人工确认）: %s | %s",
+                len(urls), exc,
+            )
         logger.info(
             "[News] 推送成功%s：%d 条 | %s | message_id=%s",
             "（历史轮换）" if from_rotate else "",
@@ -318,6 +383,7 @@ def push(cfg: dict, store: NewsStore, records: list[dict] | None,
             "count": len(records),
             "titles": titles,
             "message_id": result.get("message_id"),
+            "rotate": from_rotate,
         }
 
     logger.error("[News] 推送失败 code=%s msg=%s", result.get("code"), result.get("msg"))

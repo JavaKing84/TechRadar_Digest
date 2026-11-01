@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS articles (
     payload     TEXT NOT NULL,             -- {title_zh, summary, full_translation, summaries, image_key, cover_image, is_fallback}
     status      TEXT NOT NULL DEFAULT 'pending',   -- pending / pushed / rejected
     created_at  TEXT NOT NULL,
-    pushed_at   TEXT
+    pushed_at   TEXT,
+    rotate_count INTEGER NOT NULL DEFAULT 0  -- 被「历史轮换」重推过几次
 );
 CREATE INDEX IF NOT EXISTS idx_articles_status ON articles(status, created_at);
 """
@@ -57,6 +58,7 @@ class NewsStore:
         self._conn.executescript(SCHEMA)
         self._conn.commit()
         self._migrate_canonical()
+        self._migrate_rotate_count()
 
     # ---------------------------------------------------------------
     # 迁移：老库没有 canonical 列 / 老行没填 canonical
@@ -100,6 +102,21 @@ class NewsStore:
                 "CREATE INDEX IF NOT EXISTS idx_articles_canonical_nu ON articles(canonical)"
             )
             self._conn.commit()
+
+    def _migrate_rotate_count(self) -> None:
+        """
+        # [表面] 给老库补上 rotate_count 列
+        # [本质] 轮换次数要能跨轮次累积，否则「同一篇最多重推 2 次」无从统计；
+        #        老库没有这一列，CREATE TABLE IF NOT EXISTS 不会改已存在的表
+        # [后果] 老库升级后历史条目 rotate_count 从 0 起算，轮换限制立即生效
+        """
+        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(articles)")}
+        if "rotate_count" not in cols:
+            self._conn.execute(
+                "ALTER TABLE articles ADD COLUMN rotate_count INTEGER NOT NULL DEFAULT 0"
+            )
+            self._conn.commit()
+            logger.info("[DB] 已为老库补上 rotate_count 列")
 
     def close(self) -> None:
         try:
@@ -180,31 +197,58 @@ class NewsStore:
         rows = self.pick_pending_many(1)
         return rows[0] if rows else None
 
-    def pick_rotate_many(self, limit: int, cooldown_hours: float = 4) -> list[dict]:
+    def pick_rotate_many(self, limit: int, cooldown_hours: float = 4,
+                         max_age_days: float = 7, max_times: int = 2) -> list[dict]:
         """
         # [表面] 没有新条目时，从历史里挑最久没推的 limit 条
         # [本质] 周末源站更新慢，一直等新的会让群里断更；cooldown 挡住
-        #        「刚推完又推同一条」
-        # [后果] 新闻不断更，也不短时间重复
+        #        「刚推完又推同一条」。但只有 cooldown 是不够的：
+        #        抓取长期失败时，同一批老新闻会被无限重推，群里看几天就腻了。
+        #        所以再叠两道限制——
+        #          ① 入库超过 max_age_days 天的不再进池（古董新闻没有推送价值）
+        #          ② rotate_count 达到 max_times 的不再进池（同一篇最多重推 N 次）
+        #        max_age_days / max_times 传 0 或负数表示关掉该限制。
+        # [后果] 轮换只在「最近一周的存货」里转，且每篇最多出现 max_times 次；
+        #        用完就彻底退出，不会无限循环。池子空了宁可断更，也不推古董。
         """
         if limit <= 0:
             return []
-        cutoff = (datetime.now() - timedelta(hours=cooldown_hours)).strftime("%Y-%m-%d %H:%M:%S")
-        cur = self._conn.execute(
-            "SELECT * FROM articles WHERE status = 'pushed' AND (pushed_at IS NULL OR pushed_at <= ?)"
-            " ORDER BY pushed_at ASC LIMIT ?",
-            (cutoff, limit),
+        now = datetime.now()
+        where = ["status = 'pushed'"]
+        params: list[object] = []
+
+        # [表面] 冷却期：上一次推送距今不足 cooldown 小时的不选
+        where.append("(pushed_at IS NULL OR pushed_at <= ?)")
+        params.append((now - timedelta(hours=cooldown_hours)).strftime("%Y-%m-%d %H:%M:%S"))
+
+        # [表面] 年龄上限：入库太久的直接排除
+        # [本质] 用 created_at（入库时间）而不是 pushed_at：
+        #        pushed_at 每轮都会刷新，拿它算年龄会让老新闻永远「看起来是新的」
+        if max_age_days and max_age_days > 0:
+            where.append("created_at >= ?")
+            params.append((now - timedelta(days=float(max_age_days))).strftime("%Y-%m-%d %H:%M:%S"))
+
+        # [表面] 重推次数上限
+        if max_times and max_times > 0:
+            where.append("COALESCE(rotate_count, 0) < ?")
+            params.append(int(max_times))
+
+        sql = (
+            "SELECT * FROM articles WHERE " + " AND ".join(where)
+            + " ORDER BY pushed_at ASC LIMIT ?"
         )
+        params.append(limit)
+        cur = self._conn.execute(sql, tuple(params))
         return [self._row_to_dict(row) for row in cur.fetchall()]
 
-    def pick_rotate(self, cooldown_hours: float = 4) -> dict | None:
+    def pick_rotate(self, cooldown_hours: float = 4,
+                    max_age_days: float = 7, max_times: int = 2) -> dict | None:
         """
         # [表面] 没有新条目时，从历史里挑最久没推的一条
-        # [本质] 周末源站更新慢，一直等新的会让群里断更；cooldown 挡住
-        #        「刚推完又推同一条」
-        # [后果] 新闻不断更，也不短时间重复
+        # [本质] 与 pick_rotate_many 同一套筛选（冷却 / 年龄 / 重推次数）
+        # [后果] 单条轮换与整卡轮换的选条口径一致
         """
-        rows = self.pick_rotate_many(1, cooldown_hours)
+        rows = self.pick_rotate_many(1, cooldown_hours, max_age_days, max_times)
         return rows[0] if rows else None
 
     # ---------------------------------------------------------------
@@ -223,6 +267,24 @@ class NewsStore:
 
     def mark_pushed(self, url: str) -> None:
         self.mark_pushed_many([url])
+
+    def mark_rotated_many(self, urls: list[str]) -> None:
+        """
+        # [表面] 轮换推送成功后，除了刷新 pushed_at，再把 rotate_count 加一
+        # [本质] 新文章的首次推送与「旧文重推」必须分开记：
+        #        前者 rotate_count 保持 0，后者累加，pick_rotate_many 才有依据
+        #        把重推次数限制在 max_times 之内
+        # [后果] 同一篇旧闻最多被轮换推送 max_times 次，之后永久退出轮换池
+        """
+        if not urls:
+            return
+        now = _now()
+        self._conn.executemany(
+            "UPDATE articles SET status = 'pushed', pushed_at = ?,"
+            " rotate_count = COALESCE(rotate_count, 0) + 1 WHERE url = ?",
+            [(now, url) for url in urls],
+        )
+        self._conn.commit()
 
     def stats(self) -> dict:
         cur = self._conn.execute("SELECT status, COUNT(*) AS n FROM articles GROUP BY status")

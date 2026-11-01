@@ -671,6 +671,11 @@ def crawl_all(cfg: dict, seen=None) -> tuple[list[Article], list[str]]:
 
     articles: list[Article] = []
     errors: list[str] = []
+    # [表面] 真正发起过请求的源个数（与 errors 对比才能判断"是不是全挂了"）
+    # [本质] len(errors) 只说明失败几个，不知道总数；命中 total_limit 提前 break 时
+    #        后面几个源压根没跑，拿 len(sources) 当分母会误判
+    # [后果] "1 个源失败 + 3 个源正常"不会被当成整轮失败
+    attempted = 0
 
     proxy_ctx = _bypass_env_proxy() if bypass else _null_context()
     with proxy_ctx:
@@ -708,6 +713,7 @@ def crawl_all(cfg: dict, seen=None) -> tuple[list[Article], list[str]]:
                 remain = min(max_items, total_limit - len(articles))
                 if remain <= 0:
                     break
+                attempted += 1
                 try:
                     got = crawl_source(
                         browser, source, remain, min_body, round_seen,
@@ -728,7 +734,20 @@ def crawl_all(cfg: dict, seen=None) -> tuple[list[Article], list[str]]:
                 "[Crawl] 本轮汇总：源 %d 个，成功入库 %d 篇，失败 %d 个，总耗时 %.1fs",
                 len(sources), len(articles), len(errors), time.time() - round_started,
             )
+            # [表面] 部分源失败但其余源正常：只是一条 WARNING，不算整轮失败
+            # [本质] techcrunch 长期超时的日子里，旧逻辑「有 errors 且 0 篇」就会抛
+            #        CrawlError，把「今天确实没有新文章」渲染成「采集异常」，
+            #        真正的故障（全源挂掉）反而被这种天天出现的红字淹没
+            # [后果] 日志里一眼能分清「少个源」和「全挂了」
+            if errors and len(errors) < attempted:
+                logger.warning(
+                    "[Crawl] 部分源失败（%d/%d），其余源正常，本轮按正常处理", len(errors), attempted
+                )
 
-    if not articles and errors:
+    # [表面] 只有「所有跑过的源都抛异常」才算整轮失败
+    # [本质] 0 篇文章 + 无异常 = 今天的候选全被 canonical 去重挡掉（周末、已推完），
+    #        这是正常状态，不该抛错；一个源都没跑（sources 为空 / 预算为 0）也不算失败
+    # [后果] CrawlError 只在真故障时出现，调用方（main）不用再猜「异常」是什么
+    if not articles and attempted and len(errors) >= attempted:
         raise CrawlError("所有新闻源均未取到正文：" + " ; ".join(errors[:3]))
     return articles, errors

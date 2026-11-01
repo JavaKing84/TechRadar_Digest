@@ -64,7 +64,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     setup_logging(cfg["logging"]["dir"], cfg["logging"].get("level", "INFO"))
-    store = NewsStore(cfg["storage"]["db_path"])
+
+    # [表面] 数据库初始化失败就直接退出，不往下走
+    # [本质] NewsStore 构造会 mkdir + executescript + 两轮迁移，任何一步失败
+    #        （库文件损坏、目录不可写、磁盘满）都抛 sqlite3.Error / OSError；
+    #        不包住的话进程裸崩，日志里只剩 traceback，cron 也只看到非零退出码
+    # [后果] 打出明确 ERROR + 退出码 3，运维一眼看出是存储层而不是抓取
+    try:
+        store = NewsStore(cfg["storage"]["db_path"])
+    except Exception as exc:
+        logger.error("[News] 数据库初始化失败（文件损坏 / 目录不可写 / 磁盘满）: %s",
+                     exc, exc_info=True)
+        return 3
 
     try:
         if args.stats:
@@ -121,17 +132,33 @@ def main(argv: list[str] | None = None) -> int:
             except CrawlError as exc:
                 crawl_failed = True
                 logger.error("[News] 采集失败（CrawlError）: %s", exc, exc_info=True)
+            except Exception as exc:
+                # [表面] 采集阶段的任何未预期异常都不许冒到最外层
+                # [本质] 走到这里说明是代码缺陷或存储故障；裸崩会让「本轮已经
+                #        入库的条目」失去推送机会，而它们本来是能推的
+                # [后果] 记全栈 + 继续走推送（推队列里的存量），机器人不停摆
+                crawl_failed = True
+                logger.error("[News] 采集阶段未预期异常，本轮跳过采集: %s", exc, exc_info=True)
 
         pushed = {"ok": False, "reason": "skipped"}
         if not args.no_push:
-            pushed = runner.push(cfg, store, records, dry_run=args.dry_run)
+            try:
+                pushed = runner.push(cfg, store, records, dry_run=args.dry_run)
+            except Exception as exc:
+                # [表面] 推送阶段异常兜住，不让进程崩
+                # [本质] 条目此刻仍是 pending（状态写库在发送成功之后），
+                #        下一轮会自动重发，不会因此丢内容
+                # [后果] 本轮返回失败码，但数据不丢
+                logger.error("[News] 推送阶段未预期异常: %s", exc, exc_info=True)
+                pushed = {"ok": False, "reason": f"exception: {exc}", "count": 0}
 
         stats = store.stats()
         logger.info(
-            "[News] 完成 | 新入库 %d 条 | 推送 %s(%s 条) | 队列 pending=%d pushed=%d rejected=%d%s",
+            "[News] 完成 | 新入库 %d 条 | 推送 %s(%s 条%s) | 队列 pending=%d pushed=%d rejected=%d%s",
             len(records),
             "成功" if pushed.get("ok") else f"失败({pushed.get('reason')})",
             pushed.get("count", 0),
+            "，历史轮换" if pushed.get("rotate") else "",
             stats["pending"],
             stats["pushed"],
             stats["rejected"],

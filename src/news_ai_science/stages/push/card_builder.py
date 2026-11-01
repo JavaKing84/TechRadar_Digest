@@ -186,12 +186,15 @@ def _item_blocks(record: dict) -> list[dict]:
     return blocks
 
 
-def build_multi_news_card(records: list[dict], headline: str = "📰 AI 科技头条") -> dict:
+def build_multi_news_card(records: list[dict], headline: str = "📰 AI 科技头条",
+                         notice: str | None = None) -> dict:
     """
     # [表面] 一张聚合卡：按顺序排 N 条新闻
     # [本质] 一次推送只发一条消息。发 N 张独立卡会刷屏，且群里消息一多，
     #        用户根本划不到第二条；聚合卡在视觉上就是「一屏资讯流」
-    # [后果] 每次推送 = 1 条消息，含 1~5 条新闻，滚动自然
+    #        notice 用于「本轮无新文章、推的是历史轮换」这类必须让人看见的提示，
+    #        放在最后一条新闻之后、页脚之前，并同步标记在 subtitle 上
+    # [后果] 每次推送 = 1 条消息，含 1~5 条新闻，滚动自然；带 notice 时同一张卡内提示
     """
     items = [rec for rec in (records or []) if rec][:MAX_CARD_ITEMS]
     count = len(items)
@@ -205,6 +208,14 @@ def build_multi_news_card(records: list[dict], headline: str = "📰 AI 科技�
             elements.append({"tag": "hr"})
         elements.extend(_item_blocks(record))
 
+    # [表面] 轮换告警：红色 markdown，紧跟在新闻后面
+    # [本质] 卡片 2.0 不支持 note / 彩色 alert 组件（实测 ErrCode 200861），
+    #        markdown + font color 是唯一不会导致整卡被拒的醒目方式
+    # [后果] 用户滑到底就能看到「这是旧闻」，不用去翻日志
+    if notice:
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "markdown", "content": f"<font color='red'>{notice}</font>"})
+
     elements.append({"tag": "hr"})
     # [表面] 页脚用小号灰字
     # [本质] 卡片 2.0 **不支持 note 组件**（实测报 unsupported tag note，
@@ -214,6 +225,9 @@ def build_multi_news_card(records: list[dict], headline: str = "📰 AI 科技�
     )
 
     subtitle = f"{datetime.now().strftime('%Y-%m-%d %H:%M')} · 今日 {count} 条"
+    if notice:
+        # [表面] 标题区也标一下，卡片被折叠时也能看见
+        subtitle += "（历史轮换）"
     return {
         "schema": "2.0",
         "config": {"update_multi": True},
