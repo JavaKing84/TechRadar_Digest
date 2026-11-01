@@ -56,6 +56,7 @@ def build_client(cfg: dict) -> LLMClient | None:
             max_retries=int(llm.get("retries") or 1),
             max_tokens=int(llm.get("max_tokens") or 6000),
             disable_thinking=bool(llm.get("disable_thinking", True)),
+            thinking_off_style=str(llm.get("thinking_off_style") or "auto"),
         )
     except Exception as exc:
         logger.error("LLM 客户端初始化失败（将走兜底）: %s", exc)

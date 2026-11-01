@@ -23,6 +23,14 @@ ENV_OVERRIDES = {
     "LLM_BASE_URL": ("llm", "base_url"),
     "LLM_API_KEY": ("llm", "api_key"),
     "LLM_MODEL": ("llm", "model"),
+    # [表面] DeepSeek 专用变量名，兼容通用 LLM_* 之外的调用习惯
+    # [本质] 字典后写者覆盖先写者：同名的 base_url/model 以 DEEPSEEK_* 为准，
+    #        老部署只填 LLM_* 也照常工作，不用一次性改环境
+    # [后果] .env 里写 DEEPSEEK_API_KEY 就能生效，与 LLM_API_KEY 二选一或并存
+    "DEEPSEEK_BASE_URL": ("llm", "base_url"),
+    "DEEPSEEK_API_KEY": ("llm", "api_key"),
+    "DEEPSEEK_MODEL": ("llm", "model"),
+    "LLM_THINKING_OFF_STYLE": ("llm", "thinking_off_style"),
     "FEISHU_WEBHOOK_URL": (None, "webhook_url"),
     "FEISHU_WEBHOOK_SECRET": (None, "webhook_secret"),
     "FEISHU_APP_ID": ("feishu_app", "app_id"),

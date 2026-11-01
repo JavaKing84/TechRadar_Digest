@@ -33,22 +33,29 @@ feishu_app:
   app_secret: ""
 
 # ---- 大模型（OpenAI 兼容协议）----
-# 实际取值来自 .env 的 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL
+# [现状] 2026-11 起底层换成 DeepSeek 官方 API：
+#        模型 deepseek-flash（DeepSeek-V4.1-Flash，上下文 1M、单次输出上限 393K）。
+#        这里只写服务地址和模型名（都不是密钥，可以进公开仓库），
+#        api_key 一律留空，真实值来自 .env 的 DEEPSEEK_API_KEY。
+# [兼容] 旧的私有部署 qwen 参数仍可用：改回 LLM_BASE_URL/LLM_MODEL 即可，
+#        关思考的载荷会按 base_url 自动切换（见 stages/generate/client.py）。
 llm:
-  base_url: ""
+  base_url: "https://api.deepseek.com"
   api_key: ""
-  model: ""
+  model: "deepseek-flash"
   temperature: 0.2
   max_tokens: 8000        # 全文翻译的输出长度远大于要点摘要：4000 字英文正文
                           # 约产出 2000 字中文译文；6000 会在长文上被截断
   timeout: 120
   retries: 1
   # [关键] 关闭思考模式
-  # 实测该模型会先花 completion 预算做 reasoning：2796 字英文正文能把 3500 token
-  # 全烧在思考上，正文返回空串（finish_reason=length）。关掉后同样输入
-  # completion 从 1663 降到 114、单条耗时从 15 秒降到 2 秒，摘要照常产出。
-  # 若哪天服务端不认这个参数，代码会自动换回思考模式重试一次。
+  # deepseek-flash 默认开思考链，会把 completion 预算先花在 reasoning 上
+  #（实测同一问题的 completion_tokens 99 -> 6）。关掉后回复更快更省钱，
+  # 且 message.content 里不会混进推理文本。
   disable_thinking: true
+  # 关思考的请求体写法：auto 按 base_url 判断（含 deepseek -> thinking.type=disabled，
+  # 否则按 vLLM 的 chat_template_kwargs）。也可强制 deepseek / vllm / none。
+  thinking_off_style: "auto"
 
 # ---- 抓取 ----
 # [数量] 目标是「每轮凑够 4 条**全新**文章」：去重在链接层做（已入库的直接不打开），
