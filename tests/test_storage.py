@@ -56,7 +56,7 @@ def test_pending_many_and_mark_all(tmp_path):
         batch = store.pick_pending_many(4)
         assert len(batch) == 4
         store.mark_pushed_many([row["url"] for row in batch])
-        assert store.stats() == {"pending": 1, "pushed": 4}
+        assert store.stats() == {"pending": 1, "pushed": 4, "rejected": 0}
     finally:
         store.close()
 

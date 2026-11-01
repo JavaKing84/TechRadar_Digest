@@ -128,12 +128,13 @@ def main(argv: list[str] | None = None) -> int:
 
         stats = store.stats()
         logger.info(
-            "[News] 完成 | 新入库 %d 条 | 推送 %s(%s 条) | 队列 pending=%d pushed=%d%s",
+            "[News] 完成 | 新入库 %d 条 | 推送 %s(%s 条) | 队列 pending=%d pushed=%d rejected=%d%s",
             len(records),
             "成功" if pushed.get("ok") else f"失败({pushed.get('reason')})",
             pushed.get("count", 0),
             stats["pending"],
             stats["pushed"],
+            stats["rejected"],
             " | 采集异常" if crawl_failed else "",
         )
         return 0 if pushed.get("ok") else 1

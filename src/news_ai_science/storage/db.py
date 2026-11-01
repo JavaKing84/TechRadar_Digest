@@ -28,8 +28,8 @@ CREATE TABLE IF NOT EXISTS articles (
     canonical   TEXT,                      -- 去重键：host+path，无 query/fragment
     title       TEXT NOT NULL,             -- 中文标题
     source_name TEXT,
-    payload     TEXT NOT NULL,             -- {title_zh, summaries, image_key, cover_image, is_fallback}
-    status      TEXT NOT NULL DEFAULT 'pending',   -- pending / pushed
+    payload     TEXT NOT NULL,             -- {title_zh, summary, full_translation, summaries, image_key, cover_image, is_fallback}
+    status      TEXT NOT NULL DEFAULT 'pending',   -- pending / pushed / rejected
     created_at  TEXT NOT NULL,
     pushed_at   TEXT
 );
@@ -125,16 +125,42 @@ class NewsStore:
         )
         return cur.fetchone() is not None
 
-    def save(self, url: str, title: str, source_name: str, payload: dict) -> bool:
+    def save(self, url: str, title: str, source_name: str, payload: dict,
+             status: str = "pending") -> bool:
         """入库；canonical 已存在则忽略。返回 True 表示新入库。"""
         cur = self._conn.execute(
             "INSERT OR IGNORE INTO articles (url, canonical, title, source_name, payload, status, created_at)"
-            " VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
             (url, canonical_url(url), title, source_name,
-             json.dumps(payload, ensure_ascii=False), _now()),
+             json.dumps(payload, ensure_ascii=False), status, _now()),
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    def reject(self, url: str, title: str, source_name: str, payload: dict) -> bool:
+        """
+        # [表面] 把一条「翻译失败/非中文」的文章以 rejected 状态记下来
+        # [本质] 不能简单跳过不入库：is_seen 靠这张表，不记下来下一轮抓取
+        #        会再次捞到同一篇、再次翻译失败，白烧 LLM 额度还占掉本轮名额
+        # [后果] 该 URL 永久视为"已处理"，既不会重抓，也永远不会被推送
+        """
+        return self.save(url, title, source_name, payload, status="rejected")
+
+    def mark_rejected_many(self, urls: list[str]) -> None:
+        """
+        # [表面] 把被判定为非中文的条目改成 rejected（pending 和已推的都改）
+        # [本质] 推送前的二次体检可能拦下历史脏数据；不落状态的话
+        #        pick_pending_many / pick_rotate_many 下一轮还会把它们捞出来，
+        #        形成「每轮都拦、每轮都刷日志」的死循环
+        # [后果] 被拦下的条目只报一次警，之后既不再推也不再刷日志
+        """
+        if not urls:
+            return
+        self._conn.executemany(
+            "UPDATE articles SET status = 'rejected' WHERE url = ? AND status != 'rejected'",
+            [(url,) for url in urls],
+        )
+        self._conn.commit()
 
     # ---------------------------------------------------------------
     # 取待推
@@ -201,7 +227,11 @@ class NewsStore:
     def stats(self) -> dict:
         cur = self._conn.execute("SELECT status, COUNT(*) AS n FROM articles GROUP BY status")
         data = {row["status"]: row["n"] for row in cur.fetchall()}
-        return {"pending": data.get("pending", 0), "pushed": data.get("pushed", 0)}
+        return {
+            "pending": data.get("pending", 0),
+            "pushed": data.get("pushed", 0),
+            "rejected": data.get("rejected", 0),
+        }
 
     @staticmethod
     def _row_to_dict(row) -> dict:

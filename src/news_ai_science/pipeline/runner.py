@@ -13,10 +13,14 @@ from datetime import datetime
 from pathlib import Path
 
 from news_ai_science.core.logger import get_logger
-from news_ai_science.core.text import url_slug
+from news_ai_science.core.text import truncate, url_slug
 from news_ai_science.stages.crawl.web import crawl_all
 from news_ai_science.stages.generate.client import LLMClient
-from news_ai_science.stages.generate.translator import translate
+from news_ai_science.stages.generate.translator import (
+    TITLE_CHARS,
+    payload_problems,
+    translate,
+)
 from news_ai_science.stages.push.card_builder import (
     MAX_CARD_ITEMS,
     build_multi_news_card,
@@ -32,6 +36,12 @@ logger = get_logger(__name__)
 #        这里只是配置缺失时的兜底
 # [后果] 不配 config 也不会退化成「一次一条」
 DEFAULT_PER_RUN = 4
+
+# [表面] 候选池最多放大到目标条数的几倍
+# [本质] 翻译失败 / 非中文的条目会被丢弃，丢一条就少一条；只按 target 取候选，
+#        出现两条坏数据本轮就只剩一半内容。多备候选才能补位
+# [后果] 有坏条目时仍能凑满 per_run，坏条目也不会白白占掉名额
+CANDIDATE_FACTOR = 3
 
 
 def build_client(cfg: dict) -> LLMClient | None:
@@ -71,12 +81,38 @@ def per_run(cfg: dict) -> int:
     return max(1, min(MAX_CARD_ITEMS, value))
 
 
+def _discard(store: NewsStore, art, reason: str, transient: bool = False) -> None:
+    """
+    # [表面] 把一条不要的新闻丢弃；内容问题记成 rejected，环境问题不入库
+    # [本质] 两种丢弃必须分开处理：
+    #          · 内容永久不合格（模型反复吐英文）-> 记 rejected。
+    #            不记的话 is_seen 认不出它，下一轮会重抓、重翻，白烧额度；
+    #          · LLM 整轮不可用（额度/网络/没配 key）-> 什么都不记。
+    #            这是环境故障，记成 rejected 会让恢复后也永远补不回来
+    # [后果] 坏文章只烧一次额度；故障恢复后同一批新闻还能正常补推
+    """
+    if transient:
+        logger.error("[News] 本轮丢弃（LLM 不可用，不推，下轮重试）: %s | %s",
+                     art.title[:40], reason)
+        return
+    logger.error("[News] 丢弃本条（非中文 / 翻译失败，不推送）: %s | %s",
+                 art.title[:40], reason)
+    store.reject(
+        art.url,
+        truncate(art.title, TITLE_CHARS),
+        art.source_name,
+        {"rejected": True, "reason": reason, "is_fallback": False},
+    )
+
+
 def collect(cfg: dict, store: NewsStore, client: LLMClient | None) -> list[dict]:
     """
     # [表面] 抓一轮新闻，备齐 N 条可推送的记录（已入库）
     # [本质] 顺序是「链接层去重 -> 必须有配图 -> 翻译摘要 -> 上传图 -> 入库」：
     #        最贵的两步排在最便宜的两道门之后；target 由 push.per_run 决定
-    # [后果] 返回 0~N 条记录；一条都没有时返回空列表
+    #        翻译结果必须过中文体检：不合格的条目直接丢弃并从候选池补位，
+    #        所以候选池取 target 的若干倍，而不是刚好 target 条
+    # [后果] 返回 0~N 条记录；一条都没有时返回空列表（宁可少推，绝不推英文）
     """
     crawl_cfg = cfg.get("crawl") or {}
     require_image = bool(crawl_cfg.get("require_image", True))
@@ -99,16 +135,24 @@ def collect(cfg: dict, store: NewsStore, client: LLMClient | None) -> list[dict]
         logger.warning("[News] 没有未推送且有配图的新文章")
         return []
 
-    fresh = fresh[:target]
+    candidates = fresh[: target * CANDIDATE_FACTOR]
     uploader = build_uploader(cfg)
     if not uploader.enabled:
         logger.warning("[News] 飞书应用凭证缺失，本轮无法上传配图（卡片将无图）")
 
     records: list[dict] = []
-    for index, art in enumerate(fresh, start=1):
+    for art in candidates:
+        if len(records) >= target:
+            break
+
         info = translate(art, client)
+        if info.get("rejected"):
+            _discard(store, art, str(info.get("reason") or "翻译彻底失败"),
+                     transient=bool(info.get("transient")))
+            continue
+
         payload = {
-            "title_zh": info.get("title_zh") or art.title,
+            "title_zh": info.get("title_zh") or "",
             # [表面] 卡片右侧摘要（≤100 字）
             # [本质] 与 full_translation 一起入库：轮换推送时无需再调 LLM，
             #        历史条目也能直接渲染成新版卡片
@@ -121,12 +165,16 @@ def collect(cfg: dict, store: NewsStore, client: LLMClient | None) -> list[dict]
             "cover_image": art.cover_image,
             "is_fallback": bool(info.get("is_fallback")),
         }
-        record = {
-            "url": art.url,
-            "title": payload["title_zh"],
-            "source_name": art.source_name,
-            "info": payload,
-        }
+
+        # [表面] 入库前的最后一道闸：翻译层说合格，这里再独立量一次
+        # [本质] 翻译层将来若被改动（换模型、改提示词），这道闸仍能兜住；
+        #        两道闸用同一套阈值（payload_problems），不会互相打架
+        # [后果] 任何英文内容都进不了库，也就永远进不了群
+        problems = payload_problems(payload)
+        if problems:
+            _discard(store, art, "内容非中文：" + "、".join(problems))
+            continue
+
         if art.cover_image:
             img_key = uploader.upload_from_url(art.cover_image) or ""
             if not img_key:
@@ -138,16 +186,27 @@ def collect(cfg: dict, store: NewsStore, client: LLMClient | None) -> list[dict]
             payload["image_key"] = img_key
 
         store.save(art.url, payload["title_zh"], art.source_name, payload)
-        records.append(record)
+        records.append({
+            "url": art.url,
+            "title": payload["title_zh"],
+            "source_name": art.source_name,
+            "info": payload,
+        })
         logger.info(
             "[News] 备好 %d/%d: %s | 摘要 %d 字 | 译文 %d 字 | 配图 %s | 兜底 %s | slug=%s",
-            index, len(fresh),
+            len(records), target,
             payload["title_zh"][:36],
             len(payload["summary"]),
             len(payload["full_translation"]),
             "有" if payload["image_key"] else "无",
             "是" if payload["is_fallback"] else "否",
             url_slug(art.url),
+        )
+
+    if len(records) < target:
+        logger.warning(
+            "[News] 本轮只备好 %d/%d 条（其余候选非中文或翻译失败，已丢弃）",
+            len(records), target,
         )
     return records
 
@@ -177,6 +236,33 @@ def push(cfg: dict, store: NewsStore, records: list[dict] | None,
     if not records:
         logger.error("[News] 没有可推的新闻（队列空且冷却期内无历史可轮换）")
         return {"ok": False, "reason": "no_record", "count": 0}
+
+    # [表面] 上卡前的第二道闸：逐条做中文体检，非中文的一条都不许进卡
+    # [本质] 记录可能来自两处：本轮 collect（已验过）和历史轮换（库里躺着
+    #        旧版兜底留下的英文条目）。collect 只覆盖第一条路径，
+    #        轮换路径必须在这里再拦一次，否则英文会隔几小时又冒出来一次
+    # [后果] 群里不会出现任何英文条目；被拦下的历史条目落 rejected，不再重复冒头
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for record in records:
+        problems = payload_problems(
+            record.get("info") or {}, fallback_title=str(record.get("title") or "")
+        )
+        if problems:
+            logger.error(
+                "[News] 上卡前拦下非中文条目（不推送）: %s | %s",
+                str(record.get("title") or "")[:40], "、".join(problems),
+            )
+            dropped.append(record)
+            continue
+        kept.append(record)
+    if dropped:
+        store.mark_rejected_many([str(record.get("url") or "") for record in dropped])
+    records = kept
+
+    if not records:
+        logger.error("[News] 待推条目全部非中文，本轮不推送（已标记 rejected）")
+        return {"ok": False, "reason": "all_rejected", "count": 0}
 
     records = records[:limit]
     card = build_multi_news_card(records)
