@@ -69,10 +69,13 @@ crawl:
   min_body_chars: 300     # 正文短于这个数视为抽取失败，丢弃该篇
   retries: 2              # 单页导航失败重试次数（1.5s、3s 指数退避 + 抖动）
   request_interval: 1.2   # 同一站点两次请求的最小间隔（秒，含 ±25% 抖动）
-  page_timeout_ms: 15000  # 单次导航超时。曾用 45000：techcrunch 在无头浏览器下
-                          # 永远等不到 domcontentloaded（同一容器里 urllib 直取是
-                          # 200/1s），45s×retries 白烧 90s 还占掉整轮名额。
-                          # 15s 足以覆盖正常站点首屏（实测正文页 2~5s）。
+  page_timeout_ms: 15000  # 单次导航超时（wait_until=commit，收到响应头即算到达）
+  dom_settle_ms: 3000     # 拿到响应头后再等多久让 DOMContentLoaded 触发（软等待，
+                          # 超时不算失败）。techcrunch 的 HTML 早就到了（300KB、
+                          # 41 个文章链接），但 head 里同步加载的 snap.licdn.com /
+                          # google recaptcha / api.rlcdn.com 在容器出口上挂死，
+                          # DOMContentLoaded 永远不来——把「有没有内容」的判定权
+                          # 交给广告域名就是这个源长期 0 篇的真因。设 0 = 完全不等。
   source_budget_s: 60     # 单个源的总耗时预算（秒），超了保留已抓到的、放弃剩余链接。
                           # 逐次超时挡不住「每篇都慢一点」的累积，按源封顶才有效。
 

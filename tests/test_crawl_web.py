@@ -12,7 +12,6 @@ import pytest
 from news_ai_science.core.errors import CrawlError
 from news_ai_science.stages.crawl import web
 
-
 # ---------------------------------------------------------------------
 # 链接规范化
 # ---------------------------------------------------------------------
@@ -126,6 +125,9 @@ class _FlakyPage:
             raise TimeoutError("模拟超时")
         return None
 
+    def wait_for_load_state(self, state, timeout=None):  # noqa: ANN001
+        return None
+
 
 def test_goto_retries_then_succeeds(monkeypatch) -> None:
     monkeypatch.setattr(web, "RETRY_BASE_DELAY", 0.0)
@@ -169,6 +171,9 @@ class _TimeoutRecorder:
         self.timeouts.append(timeout)
         return None
 
+    def wait_for_load_state(self, state, timeout=None):  # noqa: ANN001
+        return None
+
 
 def test_goto_default_timeout_is_15000() -> None:
     page = _TimeoutRecorder()
@@ -181,6 +186,58 @@ def test_goto_timeout_is_overridable() -> None:
     page = _TimeoutRecorder()
     web._goto(page, "https://a.com/x", timeout_ms=30000)
     assert page.timeouts == [30000]
+
+
+# ---------------------------------------------------------------------
+# 等待策略（2026-11-01 techcrunch 长期 0 篇的真因）
+#   主文档 200、HTML 300KB、41 个文章链接都在，但 head 里同步加载的
+#   snap.licdn.com / google recaptcha / api.rlcdn.com 在容器出口上挂死，
+#   解析器停在那一行，DOMContentLoaded 永远不来。
+#   所以：goto 只等 commit；DOMContentLoaded 变成「等得到更好」的软等待。
+# ---------------------------------------------------------------------
+
+class _BlockedPage:
+    """替身：响应头到手就算 goto 成功，但 DOMContentLoaded 永远等不到。"""
+
+    def __init__(self) -> None:
+        self.wait_untils: list[str] = []
+        self.settle_timeouts: list[int] = []
+        self.goto_calls = 0
+
+    def goto(self, url, timeout=None, wait_until=None):  # noqa: ANN001
+        self.goto_calls += 1
+        self.wait_untils.append(wait_until)
+        return None
+
+    def wait_for_load_state(self, state, timeout=None):  # noqa: ANN001
+        self.settle_timeouts.append(timeout)
+        raise TimeoutError("模拟第三方追踪脚本挂起")
+
+
+def test_goto_waits_for_commit_only() -> None:
+    page = _BlockedPage()
+    web._goto(page, "https://techcrunch.com/category/ai/", "[techcrunch] 列表页")
+    assert page.wait_untils == ["commit"]
+
+
+def test_missing_domcontentloaded_is_not_a_failure() -> None:
+    """软等待超时不能被当成导航失败——否则会白重试 2 次再来一遍超时。"""
+    page = _BlockedPage()
+    web._goto(page, "https://techcrunch.com/category/ai/", "[techcrunch] 列表页")
+    assert page.goto_calls == 1
+
+
+def test_settle_default_is_3000ms() -> None:
+    page = _BlockedPage()
+    web._goto(page, "https://a.com/x")
+    assert web.DOM_SETTLE_MS == 3000
+    assert page.settle_timeouts == [3000]
+
+
+def test_settle_zero_skips_domcontentloaded() -> None:
+    page = _BlockedPage()
+    web._goto(page, "https://a.com/x", settle_ms=0)
+    assert page.settle_timeouts == []
 
 
 class _StubPage:

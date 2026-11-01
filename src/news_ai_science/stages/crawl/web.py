@@ -18,7 +18,7 @@ import os
 import random
 import re
 import time
-from urllib.parse import parse_qsl, urlencode, urldefrag, urljoin, urlparse
+from urllib.parse import parse_qsl, urldefrag, urlencode, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -30,15 +30,37 @@ from news_ai_science.core.text import collapse_spaces
 logger = get_logger(__name__)
 
 # [表面] 单次 page.goto 的超时（毫秒）
-# [本质] 原值 45000 是按「家宽偶发抖动」定的，但线上实测 techcrunch 的列表页
-#        在 Camoufox 下永远等不到 domcontentloaded（同一容器里 urllib 直取却是
-#        200 / 1.0s）。这类站点不是"慢"，是对浏览器指纹不友好，等 45s 还是 45s。
-#        而 45s × retries(2) = 90s+ 全耗在一个源上，一轮的取名额度被它独占。
+# [本质] 现在 goto 用的是 wait_until="commit"（收到响应头就返回），这个超时
+#        只兜「连响应头都拿不到」的情况：DNS 挂、TCP 不通、服务端不回包。
+#        原值 45000 是按「家宽偶发抖动」定的，45s × retries(2) = 90s+ 全耗在
+#        一个源上，一轮的取名额度被它独占。真正的病根是等 DOMContentLoaded
+#        （见 DOM_SETTLE_MS），不是这里给得不够。
 # [后果] 15s 覆盖正常站点首屏绰绰有余（实测正文页 2~5s），坏源 90s → 30s，
 #        整轮从 ~120s 降到 ~60s。确有慢站需要放宽时改 config.yaml 的
 #        crawl.page_timeout_ms，不必动代码。
 PAGE_TIMEOUT_MS = 15000
 LIST_WAIT_MS = 25000
+
+# [表面] goto 拿完响应头之后，最多再等多久让 DOMContentLoaded 触发（毫秒）
+# [本质] 2026-11-01 定位到 techcrunch 长期超时的真因：不是网络、不是反爬，
+#        主文档 200 拿到、HTML 300KB、41 个文章链接全在，但 readyState 卡在
+#        loading——因为页面 head 里同步加载了 snap.licdn.com / google recaptcha /
+#        api.rlcdn.com 这些第三方追踪脚本，它们在容器出口上不发包也不关闭连接，
+#        HTML 解析器就停在那一行，DOMContentLoaded 永远不来。
+#        wait_until="domcontentloaded" 等于把「页面有没有内容」的判定权交给了
+#        三个广告域名。改成 commit（收到响应头即返回）+ 这段软等待：
+#        等不到 DOMContentLoaded 也不算失败，直接用已经到达的 HTML。
+# [后果] techcrunch 从「45s/15s 稳定超时、0 篇」变成 2.6 秒拿到 41 个链接；
+#        正常站点（MIT/Wired/VB）DOMContentLoaded 会在 1 秒内触发，行为不变
+DOM_SETTLE_MS = 3000
+
+# [表面] 正文页等正文出现的最长时长（毫秒）与轮询间隔
+# [本质] commit 之后 HTML 是流式到达的，抽得太早会抽到 0 字（techcrunch 实测
+#        2.6s 时 110KB/0 字，3.4s 才 227KB/2500 字）。固定 sleep 是赌博，
+#        轮询才是「有了就走、没有才等」，慢站的代价被封在 BODY_WAIT_MS 内。
+# [后果] 单篇最坏多花 6 秒，正常站几乎无感知；换掉「0 字误杀」
+BODY_WAIT_MS = 6000
+BODY_POLL_MS = 500
 
 # [表面] 单个源的总耗时预算（秒），0 表示不限
 # [本质] 超时只管"单次导航"，一个源仍可以靠「列表页重试 + 多篇正文」累加，
@@ -175,8 +197,29 @@ def canonical_url(url: str) -> str:
     ).geturl()
 
 
+def _settle(page, label: str, url: str, settle_ms: int) -> None:
+    """
+    # [表面] 响应头到手后，再给页面 settle_ms 毫秒去触发 DOMContentLoaded
+    # [本质] 这一步是「尽力而为」而不是「必须」：拿不到 DOMContentLoaded 说明
+    #        页面被某个第三方脚本卡住了，但正文/列表链接通常已经在 HTML 里，
+    #        继续等只是陪广告域名一起挂。所以超时只记一条 INFO，绝不抛错。
+    #        反过来说 settle_ms=0 时直接跳过，留给调试用。
+    # [后果] 正常站点 <1s 返回；被卡的站点固定多花 settle_ms，然后照样有内容
+    """
+    if settle_ms <= 0:
+        return
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=settle_ms)
+    except Exception:  # noqa: BLE001 - 等不到不是错误，只是页面被第三方脚本卡住
+        logger.info(
+            "%s DOMContentLoaded 未在 %dms 内触发（第三方脚本挂起，忽略）: %s",
+            label or "[goto]", settle_ms, url[:70],
+        )
+
+
 def _goto(page, url: str, label: str = "", attempts: int = DEFAULT_RETRIES,
-          timeout_ms: int = PAGE_TIMEOUT_MS) -> None:
+          timeout_ms: int = PAGE_TIMEOUT_MS,
+          settle_ms: int = DOM_SETTLE_MS) -> None:
     """
     # [表面] page.goto 的带重试版本
     # [本质] 只重试「可恢复」的失败——超时、连接被重置、5xx 都是抖动；
@@ -185,12 +228,15 @@ def _goto(page, url: str, label: str = "", attempts: int = DEFAULT_RETRIES,
     #        退避用 attempts 的指数（1.5s、3s…）加随机抖动，避免多源同时重试。
     #        timeout_ms 由调用方透传（crawl.page_timeout_ms），不再写死在函数里，
     #        否则调参只能改代码、改完还得重建镜像。
+    #        等待策略从 domcontentloaded 改成 commit：见 DOM_SETTLE_MS 注释，
+    #        「页面有没有内容」不能交给第三方追踪脚本决定。
     # [后果] 单页抖动不再直接计为「该源失败」，日志里能看到第几次重试成功
     """
     last_exc: Exception | None = None
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+            page.goto(url, timeout=timeout_ms, wait_until="commit")
+            _settle(page, label, url, settle_ms)
             if attempt > 1:
                 logger.info("%s 第 %d 次尝试成功: %s", label or "[goto]", attempt, url[:70])
             return
@@ -490,7 +536,8 @@ def crawl_source(browser, source: dict, max_items: int, min_body_chars: int,
                  seen=None, retries: int = DEFAULT_RETRIES,
                  interval: float = DEFAULT_REQUEST_INTERVAL,
                  page_timeout_ms: int = PAGE_TIMEOUT_MS,
-                 source_budget_s: float = 0.0) -> list[Article]:
+                 source_budget_s: float = 0.0,
+                 dom_settle_ms: int = DOM_SETTLE_MS) -> list[Article]:
     """
     # [表面] 抓一个源：列表页 -> 文章页 -> Article 列表
     # [本质] 列表页没取到链接就抛 CrawlError（由 crawl_all 记录并继续下一个源）；
@@ -511,7 +558,7 @@ def crawl_source(browser, source: dict, max_items: int, min_body_chars: int,
     try:
         list_page = browser.new_page()
         _goto(list_page, list_url, f"[{source_id}] 列表页", retries,
-              timeout_ms=page_timeout_ms)
+              timeout_ms=page_timeout_ms, settle_ms=dom_settle_ms)
         # [表面] 轮询等候选链接出现，而不是死等固定秒数
         # [本质] 列表页快慢差 10 倍以上（命中缓存 2 秒，冷启动 20 秒）
         # [后果] 快站 2 秒往下走，慢站最多等 LIST_WAIT_MS
@@ -587,12 +634,21 @@ def crawl_source(browser, source: dict, max_items: int, min_body_chars: int,
         try:
             page = browser.new_page()
             _goto(page, link, f"[{source_id}] 正文页", retries,
-                  timeout_ms=page_timeout_ms)
-            # [表面] 只等极短一段
-            # [本质] 正文在首屏 HTML 里就有了，等再久也等不到更多文字
-            # [后果] 单篇耗时从 ~20 秒降到个位数
-            page.wait_for_timeout(400)
-            body = extract_main_text(page.content())
+                  timeout_ms=page_timeout_ms, settle_ms=dom_settle_ms)
+            # [表面] 轮询等正文出现，而不是睡固定 400ms 就抽
+            # [本质] goto 改成 commit 之后，page.content() 拿到的是「已经到达的那部分」
+            #        流式 HTML：实测 techcrunch 正文页 2.6s 时只有 110KB、抽 0 字，
+            #        3.4s 才到 227KB、抽 2500 字。固定延时就是在赌「那一刻刚好到齐」，
+            #        赌输的表现就是日志里那句「正文过短(0 字)，丢弃该篇」。
+            #        改成和列表页同一种思路：抽到够长就走，最多等 BODY_WAIT_MS。
+            # [后果] 快站仍然立刻往下走，慢站封顶 BODY_WAIT_MS，不会再 0 字误杀
+            body = ""
+            body_deadline = time.time() + BODY_WAIT_MS / 1000.0
+            while True:
+                body = extract_main_text(page.content())
+                if len(body) >= min_body_chars or time.time() >= body_deadline:
+                    break
+                page.wait_for_timeout(BODY_POLL_MS)
             if len(body) < min_body_chars:
                 skipped_short += 1
                 logger.warning("[%s] 正文过短(%d 字)，丢弃该篇: %s", source_id, len(body), link)
@@ -665,6 +721,10 @@ def crawl_all(cfg: dict, seen=None) -> tuple[list[Article], list[str]]:
     page_timeout_ms = PAGE_TIMEOUT_MS if timeout_raw is None else int(timeout_raw)
     budget_raw = crawl_cfg.get("source_budget_s")
     source_budget_s = DEFAULT_SOURCE_BUDGET_S if budget_raw is None else float(budget_raw)
+    # [表面] commit 之后的软等待时长（见 DOM_SETTLE_MS）
+    # [本质] 用 is None 而不是 `or`：0 是合法值（= 不等，直接用响应头回来的 HTML）
+    settle_raw = crawl_cfg.get("dom_settle_ms")
+    dom_settle_ms = DOM_SETTLE_MS if settle_raw is None else int(settle_raw)
 
     from camoufox import DefaultAddons
     from camoufox.sync_api import Camoufox
@@ -720,6 +780,7 @@ def crawl_all(cfg: dict, seen=None) -> tuple[list[Article], list[str]]:
                         retries=retries, interval=interval,
                         page_timeout_ms=page_timeout_ms,
                         source_budget_s=source_budget_s,
+                        dom_settle_ms=dom_settle_ms,
                     )
                     articles.extend(got)
                     collected.update(canonical_url(a.url) for a in got)
