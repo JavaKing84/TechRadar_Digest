@@ -29,8 +29,23 @@ from news_ai_science.core.text import collapse_spaces
 
 logger = get_logger(__name__)
 
-PAGE_TIMEOUT_MS = 45000
+# [表面] 单次 page.goto 的超时（毫秒）
+# [本质] 原值 45000 是按「家宽偶发抖动」定的，但线上实测 techcrunch 的列表页
+#        在 Camoufox 下永远等不到 domcontentloaded（同一容器里 urllib 直取却是
+#        200 / 1.0s）。这类站点不是"慢"，是对浏览器指纹不友好，等 45s 还是 45s。
+#        而 45s × retries(2) = 90s+ 全耗在一个源上，一轮的取名额度被它独占。
+# [后果] 15s 覆盖正常站点首屏绰绰有余（实测正文页 2~5s），坏源 90s → 30s，
+#        整轮从 ~120s 降到 ~60s。确有慢站需要放宽时改 config.yaml 的
+#        crawl.page_timeout_ms，不必动代码。
+PAGE_TIMEOUT_MS = 15000
 LIST_WAIT_MS = 25000
+
+# [表面] 单个源的总耗时预算（秒），0 表示不限
+# [本质] 超时只管"单次导航"，一个源仍可以靠「列表页重试 + 多篇正文」累加，
+#        把整轮拖到分钟级。按源设总预算才是真正的止损：超了就把已拿到的留下、
+#        剩下的链接直接放弃，不能让一个源决定整轮时长。
+# [后果] 无论站点怎么磨蹭，每轮总时长上限 = 源数 × 预算，可预期
+DEFAULT_SOURCE_BUDGET_S = 60.0
 
 # [表面] 导航失败时重试几次、每次间隔多久
 # [本质] 新闻站偶发 502/连接重置/首包超时，重试一次就能过；重试太多
@@ -160,19 +175,22 @@ def canonical_url(url: str) -> str:
     ).geturl()
 
 
-def _goto(page, url: str, label: str = "", attempts: int = DEFAULT_RETRIES) -> None:
+def _goto(page, url: str, label: str = "", attempts: int = DEFAULT_RETRIES,
+          timeout_ms: int = PAGE_TIMEOUT_MS) -> None:
     """
     # [表面] page.goto 的带重试版本
     # [本质] 只重试「可恢复」的失败——超时、连接被重置、5xx 都是抖动；
     #        地址本身写错（net::ERR_NAME_NOT_RESOLVED 之类）重试也没用，
     #        但无法可靠区分，所以统一重试并靠次数上限兜底。
     #        退避用 attempts 的指数（1.5s、3s…）加随机抖动，避免多源同时重试。
+    #        timeout_ms 由调用方透传（crawl.page_timeout_ms），不再写死在函数里，
+    #        否则调参只能改代码、改完还得重建镜像。
     # [后果] 单页抖动不再直接计为「该源失败」，日志里能看到第几次重试成功
     """
     last_exc: Exception | None = None
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            page.goto(url, timeout=PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
+            page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
             if attempt > 1:
                 logger.info("%s 第 %d 次尝试成功: %s", label or "[goto]", attempt, url[:70])
             return
@@ -470,7 +488,9 @@ def _cover_image(page) -> str:
 
 def crawl_source(browser, source: dict, max_items: int, min_body_chars: int,
                  seen=None, retries: int = DEFAULT_RETRIES,
-                 interval: float = DEFAULT_REQUEST_INTERVAL) -> list[Article]:
+                 interval: float = DEFAULT_REQUEST_INTERVAL,
+                 page_timeout_ms: int = PAGE_TIMEOUT_MS,
+                 source_budget_s: float = 0.0) -> list[Article]:
     """
     # [表面] 抓一个源：列表页 -> 文章页 -> Article 列表
     # [本质] 列表页没取到链接就抛 CrawlError（由 crawl_all 记录并继续下一个源）；
@@ -490,7 +510,8 @@ def crawl_source(browser, source: dict, max_items: int, min_body_chars: int,
     list_page = None
     try:
         list_page = browser.new_page()
-        _goto(list_page, list_url, f"[{source_id}] 列表页", retries)
+        _goto(list_page, list_url, f"[{source_id}] 列表页", retries,
+              timeout_ms=page_timeout_ms)
         # [表面] 轮询等候选链接出现，而不是死等固定秒数
         # [本质] 列表页快慢差 10 倍以上（命中缓存 2 秒，冷启动 20 秒）
         # [后果] 快站 2 秒往下走，慢站最多等 LIST_WAIT_MS
@@ -549,12 +570,24 @@ def crawl_source(browser, source: dict, max_items: int, min_body_chars: int,
     for link in links:
         if len(articles) >= max_items:
             break
+        # [表面] 单源总预算：超了就收手，保留已抓到的
+        # [本质] 逐一超时挡不住「每篇都慢一点」的累积；预算按源算才封得住顶。
+        #        这里 break 而不是抛错：已经拿到的文章是有效产出，
+        #        为了一个磨蹭的源把成果全丢掉是更差的选择
+        # [后果] 单源耗时可控，整轮时长不再由最慢的站决定
+        if source_budget_s > 0 and time.time() - started > source_budget_s:
+            logger.warning(
+                "[%s] 单源耗时超过预算 %.0fs，放弃剩余链接（已收 %d 篇）",
+                source_id, source_budget_s, len(articles),
+            )
+            break
         # [表面] 每次进正文页之前先按站点间隔限速
         last_request_at = _pace(last_request_at, interval)
         page = None
         try:
             page = browser.new_page()
-            _goto(page, link, f"[{source_id}] 正文页", retries)
+            _goto(page, link, f"[{source_id}] 正文页", retries,
+                  timeout_ms=page_timeout_ms)
             # [表面] 只等极短一段
             # [本质] 正文在首屏 HTML 里就有了，等再久也等不到更多文字
             # [后果] 单篇耗时从 ~20 秒降到个位数
@@ -622,6 +655,16 @@ def crawl_all(cfg: dict, seen=None) -> tuple[list[Article], list[str]]:
     #        硬编码会让换环境就得改代码；配置项缺省时回落到模块常量
     retries = int(crawl_cfg.get("retries", DEFAULT_RETRIES))
     interval = float(crawl_cfg.get("request_interval", DEFAULT_REQUEST_INTERVAL))
+    # [表面] 单页超时与单源预算都可由配置覆盖
+    # [本质] 不同出口网络（学校专线 / 家宽 / 容器）对「多久算超时」的容忍度不同，
+    #        写死在代码里意味着每次调参都要改代码 + 重建镜像。
+    #        这里用 is None 判断而不是 `or`：0 是合法取值（预算 0 = 不限），
+    #        `x or 默认值` 会把 0 悄悄吃掉——config 里 cooldown_hours: 0 就踩过这个坑。
+    # [后果] 某个站需要放宽，只改 config.yaml 重启容器，不动代码
+    timeout_raw = crawl_cfg.get("page_timeout_ms")
+    page_timeout_ms = PAGE_TIMEOUT_MS if timeout_raw is None else int(timeout_raw)
+    budget_raw = crawl_cfg.get("source_budget_s")
+    source_budget_s = DEFAULT_SOURCE_BUDGET_S if budget_raw is None else float(budget_raw)
 
     from camoufox import DefaultAddons
     from camoufox.sync_api import Camoufox
@@ -669,6 +712,8 @@ def crawl_all(cfg: dict, seen=None) -> tuple[list[Article], list[str]]:
                     got = crawl_source(
                         browser, source, remain, min_body, round_seen,
                         retries=retries, interval=interval,
+                        page_timeout_ms=page_timeout_ms,
+                        source_budget_s=source_budget_s,
                     )
                     articles.extend(got)
                     collected.update(canonical_url(a.url) for a in got)

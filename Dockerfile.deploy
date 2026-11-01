@@ -1,0 +1,36 @@
+# ============================================================================
+# 增量部署镜像（服务器专用；源码入库，便于复现）
+#
+# [为什么需要它]
+#   服务器重跑完整 Dockerfile 时，camoufox 内核那一步缓存必然未命中
+#   （daocloud 的 python:3.10-slim-bullseye tag 已漂移），会从 GitHub 拉
+#   1.29 GB 内核包。实测 120 KB/s，约 3 小时。
+#   纯 Python 改动（crawler / translator / client / config / runner）不涉及
+#   依赖、内核、fpgen 模型，因此以现有镜像为基座只覆盖代码层，
+#   构建耗时几秒，镜像体积增量约 100 KB。
+#
+# [前置条件]
+#   宿主机必须已存在 news_ai_science:backup-20261101。
+#   没有就先完整构建一次并打标签，否则这里直接 FROM 失败。
+#
+# [用法]
+#   docker build -f Dockerfile.deploy -t news_ai_science:1.0 .
+#   docker compose up -d --no-build --force-recreate
+#   （只 restart 不会重新加载 .env，改了环境变量必须 --force-recreate）
+#
+# [回滚]
+#   docker tag news_ai_science:backup-20261101 news_ai_science:1.0
+#   docker compose up -d --no-build --force-recreate
+#
+# [何时该改回完整 Dockerfile]
+#   依赖变化（requirements.txt）、浏览器内核升级、基础镜像切换时，
+#   必须把 .docker-assets/camoufox-*-lin*.zip 放到构建上下文再完整构建。
+# ============================================================================
+FROM news_ai_science:backup-20261101
+
+WORKDIR /app
+
+# 只覆盖代码层；data / logs / output 由 compose 挂载，不进镜像
+COPY main.py ./
+COPY config ./config
+COPY src ./src

@@ -153,3 +153,93 @@ def test_pace_disabled_is_noop() -> None:
 def test_crawl_source_rejects_missing_url() -> None:
     with pytest.raises(CrawlError):
         web.crawl_source(browser=None, source={"id": "x"}, max_items=1, min_body_chars=1)
+
+
+# ---------------------------------------------------------------------
+# 超时与单源预算（线上 techcrunch 拖垮整轮之后的回归）
+# ---------------------------------------------------------------------
+
+class _TimeoutRecorder:
+    """记录每次 goto 实际用的 timeout 值。"""
+
+    def __init__(self) -> None:
+        self.timeouts: list[int] = []
+
+    def goto(self, url, timeout=None, wait_until=None):  # noqa: ANN001
+        self.timeouts.append(timeout)
+        return None
+
+
+def test_goto_default_timeout_is_15000() -> None:
+    page = _TimeoutRecorder()
+    web._goto(page, "https://a.com/x")
+    assert page.timeouts == [15000]
+    assert web.PAGE_TIMEOUT_MS == 15000
+
+
+def test_goto_timeout_is_overridable() -> None:
+    page = _TimeoutRecorder()
+    web._goto(page, "https://a.com/x", timeout_ms=30000)
+    assert page.timeouts == [30000]
+
+
+class _StubPage:
+    def close(self) -> None:
+        pass
+
+    def wait_for_timeout(self, ms) -> None:  # noqa: ANN001
+        pass
+
+    def content(self) -> str:
+        return "<html><body></body></html>"
+
+
+class _StubBrowser:
+    def __init__(self) -> None:
+        self.pages = 0
+
+    def new_page(self):
+        self.pages += 1
+        return _StubPage()
+
+
+class _TimeStub:
+    """每次取时间推进 10 秒，让预算必然超时。"""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def time(self) -> float:
+        self.t += 10.0
+        return self.t
+
+
+def test_crawl_source_budget_stops_before_article_pages(monkeypatch) -> None:
+    """预算耗尽时保留已抓到的、不再开新的正文页——而不是把整轮拖到超时。"""
+    monkeypatch.setattr(web, "time", _TimeStub())
+    monkeypatch.setattr(web, "_goto", lambda *a, **k: None)
+    monkeypatch.setattr(
+        web, "_collect_links",
+        lambda page, url, selector, limit: ["https://a.com/1", "https://a.com/2"],
+    )
+    browser = _StubBrowser()
+    got = web.crawl_source(
+        browser, {"id": "t", "url": "https://a.com/list"}, max_items=2, min_body_chars=1,
+        retries=1, interval=0, source_budget_s=5,
+    )
+    assert got == []
+    assert browser.pages == 1        # 只开了列表页，正文页一个都没开
+
+
+def test_crawl_source_without_budget_keeps_going(monkeypatch) -> None:
+    """预算是可选项：不传（0 = 不限）时行为不变。"""
+    browser = _StubBrowser()
+    monkeypatch.setattr(web, "time", _TimeStub())
+    monkeypatch.setattr(web, "_goto", lambda *a, **k: None)
+    monkeypatch.setattr(web, "_collect_links", lambda *_args: ["https://a.com/1"])
+    got = web.crawl_source(
+        browser, {"id": "t", "url": "https://a.com/list"}, max_items=1, min_body_chars=9999,
+        retries=1, interval=0, source_budget_s=0,
+    )
+    assert got == []
+    assert browser.pages == 2        # 列表页 + 1 个正文页（正文过短被丢，但确实抓了）

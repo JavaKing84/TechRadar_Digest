@@ -69,6 +69,12 @@ crawl:
   min_body_chars: 300     # 正文短于这个数视为抽取失败，丢弃该篇
   retries: 2              # 单页导航失败重试次数（1.5s、3s 指数退避 + 抖动）
   request_interval: 1.2   # 同一站点两次请求的最小间隔（秒，含 ±25% 抖动）
+  page_timeout_ms: 15000  # 单次导航超时。曾用 45000：techcrunch 在无头浏览器下
+                          # 永远等不到 domcontentloaded（同一容器里 urllib 直取是
+                          # 200/1s），45s×retries 白烧 90s 还占掉整轮名额。
+                          # 15s 足以覆盖正常站点首屏（实测正文页 2~5s）。
+  source_budget_s: 60     # 单个源的总耗时预算（秒），超了保留已抓到的、放弃剩余链接。
+                          # 逐次超时挡不住「每篇都慢一点」的累积，按源封顶才有效。
 
 # ---- 新闻源 ----
 # [说明] 源清单已拆到 config/sources.yaml（改源不用碰本文件），
