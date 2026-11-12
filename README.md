@@ -1,84 +1,209 @@
-# news_ai_science · AI 科技头条机器人
+# TechRadar Digest
 
-TechCrunch / MIT TR / Wired / VentureBeat 抓正文 -> 中文标题 + 3~10 条摘要 -> 飞书**聚合图文卡**推群。
+抓科技媒体正文 → 大模型生成中文标题和摘要 → 飞书图文卡片推到群里。
 
-一条消息装 1~5 条新闻（`column_set` 左图右文 + 折叠要点 + 点击查看原文），
-纯文本推送已废弃：卡片发不出去就保持 pending 等下一轮，不再降级成文本。
+## 1. 环境
 
-## 快速开始
+Python 3.11 以上、Git、能访问外网、磁盘 6 GB。
 
-```bash
-cd D:/!pythonproject/feishu_bot/TechRadar_Digest
+## 2. 安装依赖
 
-# 1. 环境（已就绪，无需重装）
-#    .venv 里已有 camoufox 0.5.8 / playwright / openai / pyyaml / dotenv / bs4
-#    ⚠️ 严禁 pip install camoufox、严禁 python -m camoufox fetch
+Windows（PowerShell）：
 
-# 2. 配置
-cp .env.example .env          # 填 LLM_API_KEY / FEISHU_WEBHOOK_URL / FEISHU_APP_*
-# 新闻源改 config/sources.yaml；其它参数改 config/config.yaml
-
-# 3. 跑一轮
-./.venv/Scripts/python.exe main.py --once
+```powershell
+git clone https://gitee.com/ncepu-bj/Techradar_Digest.git
+cd Techradar_Digest
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-## 常用命令
+Linux：
 
-| 命令 | 作用 |
+```bash
+git clone https://gitee.com/ncepu-bj/Techradar_Digest.git
+cd Techradar_Digest
+python3 -m venv .venv
+./.venv/bin/python -m pip install -r requirements.txt
+```
+
+Linux 还要装系统库：
+
+```bash
+sudo apt-get update && sudo apt-get install -y libgtk-3-0 libdbus-glib-1-2 libxt6 libasound2 \
+  libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
+  libatk1.0-0 libatk-bridge2.0-0 libcups2 libnss3 libnspr4 libxfixes3 libxkbcommon0 \
+  libxrender1 libxi6 libgl1 libxext6 libxcb1 fonts-noto-cjk
+```
+
+pip 慢就给安装命令加阿里源，清华源目前取不到 camoufox，别用：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple
+```
+
+## 3. 配置 .env
+
+Windows：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Linux：
+
+```bash
+cp .env.example .env
+```
+
+打开 .env 在等号右边填值，不加引号不留空格。
+
+| 变量 | 必填 | 从哪来 |
+|---|---|---|
+| DEEPSEEK_API_KEY | 是 | 大模型 API Key |
+| FEISHU_WEBHOOK_URL | 是 | 飞书群 → 群设置 → 群机器人 → 自定义机器人 |
+| FEISHU_APP_ID / FEISHU_APP_SECRET | 建议 | 飞书开放平台自建应用，不填卡片没有配图 |
+| LLM_BASE_URL / LLM_MODEL | 否 | 换别家模型时才改 |
+
+## 4. 装浏览器内核
+
+pip 只装 SDK，浏览器本体要单独装。先查：
+
+Windows：
+
+```powershell
+.\.venv\Scripts\python.exe -m camoufox version
+```
+
+Linux：
+
+```bash
+./.venv/bin/python -m camoufox version
+```
+
+Installed: Yes 就跳到第 5 步。
+
+下载内核包，版本号不要改。
+
+Windows：
+
+```powershell
+curl.exe -fL -o camoufox-156.0.1-beta.36-win.x86_64.zip "https://github.com/daijro/camoufox/releases/download/v156.0.1-beta.36/camoufox-156.0.1-beta.36-win.x86_64.zip"
+```
+
+Linux：
+
+```bash
+curl -fL -o camoufox-156.0.1-beta.36-lin.x86_64.zip "https://github.com/daijro/camoufox/releases/download/v156.0.1-beta.36/camoufox-156.0.1-beta.36-lin.x86_64.zip"
+```
+
+国内慢就把 github 地址前面加上 https://ghfast.top/ ，Windows 例子：
+
+```powershell
+curl.exe -fL -o camoufox-156.0.1-beta.36-win.x86_64.zip "https://ghfast.top/https://github.com/daijro/camoufox/releases/download/v156.0.1-beta.36/camoufox-156.0.1-beta.36-win.x86_64.zip"
+```
+
+Linux 用 curl，文件名换 lin 那个。
+
+校验并安装。testzip 必须输出 None，最后一条 Installed 必须是 Yes。
+
+Windows：
+
+```powershell
+.\.venv\Scripts\python.exe -c "import zipfile;print(zipfile.ZipFile('camoufox-156.0.1-beta.36-win.x86_64.zip').testzip())"
+.\.venv\Scripts\python.exe .docker-assets/install_offline_kernel.py camoufox-156.0.1-beta.36-win.x86_64.zip
+.\.venv\Scripts\python.exe -m camoufox version
+```
+
+Linux：
+
+```bash
+./.venv/bin/python -c "import zipfile;print(zipfile.ZipFile('camoufox-156.0.1-beta.36-lin.x86_64.zip').testzip())"
+./.venv/bin/python .docker-assets/install_offline_kernel.py camoufox-156.0.1-beta.36-lin.x86_64.zip
+./.venv/bin/python -m camoufox version
+```
+
+首次启动浏览器还会拉一个 1.5 MB 的指纹模型，能出网会自动下。下不动就手动。
+
+Windows 下载：
+
+```powershell
+curl.exe -fL -o fpgen-model-release.zip "https://ghfast.top/https://github.com/scrapfly/fingerprint-generator/releases/download/model-2/2026/model-release.zip"
+```
+
+Linux 下载：
+
+```bash
+curl -fL -o fpgen-model-release.zip "https://ghfast.top/https://github.com/scrapfly/fingerprint-generator/releases/download/model-2/2026/model-release.zip"
+```
+
+Windows 安装：
+
+```powershell
+.\.venv\Scripts\python.exe .docker-assets/install_fpgen_model.py fpgen-model-release.zip
+```
+
+Linux 安装：
+
+```bash
+./.venv/bin/python .docker-assets/install_fpgen_model.py fpgen-model-release.zip
+```
+
+## 5. 运行
+
+Windows：
+
+```powershell
+.\.venv\Scripts\python.exe main.py --stats
+.\.venv\Scripts\python.exe main.py --once --dry-run
+.\.venv\Scripts\python.exe main.py --once
+```
+
+Linux：
+
+```bash
+./.venv/bin/python main.py --stats
+./.venv/bin/python main.py --once --dry-run
+./.venv/bin/python main.py --once
+```
+
+--stats 看队列。--dry-run 抓取并调模型，卡片写到 logs/card_dryrun_*.json，不发群。--once 真发群。
+
+## 6. 测试
+
+Windows：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install pytest ruff
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m ruff check .
+```
+
+Linux：
+
+```bash
+./.venv/bin/python -m pip install pytest ruff
+./.venv/bin/python -m pytest
+./.venv/bin/python -m ruff check .
+```
+
+## 7. 常见错误
+
+| 现象 | 处理 |
 |---|---|
-| `python main.py --once` | 抓取 + 摘要 + 推送（定时任务跑的就是这个） |
-| `python main.py --once --dry-run` | 只生成卡片 JSON 到 `logs/`，不发群 |
-| `python main.py --once --no-push` | 只抓取入库 |
-| `python main.py --push-only` | 不抓取，只推队列里的待推条目 |
-| `python main.py --stats` | 看队列：`{"pending": n, "pushed": m}` |
-| `make test` / `make lint` | pytest（21 例）/ ruff |
+| 配置错误: 缺少 webhook_url | .env 里 FEISHU_WEBHOOK_URL 没填 |
+| 'python' 不是内部或外部命令 | 装 Python 时没勾 Add to PATH，用 py -3 代替 python |
+| ModuleNotFoundError: news_ai_science / yaml | 用了系统 python，改成 .venv 里的 python |
+| CamoufoxNotInstalled 或抓取全失败 | 内核没装好，重做第 4 步 |
+| FpgenModelError | 指纹模型没下来，见第 4 步最后 |
+| 页面全部超时 | 新闻站要代理，给终端设 HTTPS_PROXY 环境变量 |
+| 大模型 401 | .env 里 Key 没填或填错 |
+| 连不上 202.204.64.234 | 校内网地址，校外换公网服务并同时改 LLM_BASE_URL |
+| 卡片没有配图 | 没填 FEISHU_APP_ID / FEISHU_APP_SECRET |
+| 飞书报 19021 | 机器人开了加签，补填 FEISHU_WEBHOOK_SECRET |
+| .env 改了不生效 | 文件要在项目根目录，名字必须叫 .env |
 
-## 目录
+日志在 logs/bot.log。
 
-```
-config/       sources.yaml（新闻源）  config.yaml（参数+密钥）  settings.py（只读常量）
-src/news_ai_science/
-  core/       路径、配置、日志、文本、异常
-  contracts/  Article
-  stages/     crawl(web) / generate(client, translator) / push(card_builder, image_uploader, feishu_sender)
-  pipeline/   runner
-  storage/    SQLite
-tests/        离线单测，不联网
-docs/         architecture.md（分层）  deployment.md（Docker 部署）
-.docker-assets/  Dockerfile 构建期用的离线内核安装脚本（zip 不进仓库）
-logs/         运行日志 + dry-run 卡片
-```
+## 8. 部署到服务器
 
-## Docker 部署（CentOS 7 / 内网）
-
-目标服务器 glibc 只有 2.17，Camoufox 要求 ≥ 2.28，所以走镜像而非宿主机直装。
-镜像基于 `python:3.10-slim-bullseye`（Python 3.10.18 + glibc 2.31，实测）。
-
-```bash
-# 1. 构建（首次会装系统库 + 拉浏览器内核，10~30 分钟属正常）
-docker compose up -d --build
-
-# 2. 看日志
-docker compose logs -f
-
-# 3. 只跑一轮 / 查队列（不进常驻循环）
-docker compose run --rm news-ai-science python main.py --once --dry-run
-docker compose run --rm news-ai-science python main.py --stats
-```
-
-前置条件只有两个：
-
-- **`.env` 必须在项目根目录**（被 `.gitignore` 排除，clone 下来没有，需单独传）
-- **浏览器内核**：构建期若无 `.docker-assets/camoufox-*-lin*.zip`，会联网走
-  `python -m camoufox fetch`；服务器出不了 GitHub 时必须放离线包（约 1.3 GB，不进仓库）
-
-命名规则、离线安装原理、服务器端逐步操作、代理与排错，全部见
-[`docs/deployment.md`](docs/deployment.md)。
-
-## 注意
-
-- **抓取必须走 Camoufox**：没有 RSS 路径，没有 requests 降级；单源失败跳过，全源失败才抛错。
-- **没有配图就不推这一条**：`crawl.require_image: true`，绝不用无关图凑数。
-- **不要重复装 Camoufox 内核**：内核在 `%LOCALAPPDATA%\camoufox\...\156.0.1-beta.36`，与 venv 无关。
-- **配图需要飞书应用凭证**（群机器人没有上传图片的权限），凭证缺失时卡片会无图。
-- **定时任务**：每日 08:00 / 20:00，命令是 `python main.py --once`。
+Docker 部署见 docs/deployment.md。
