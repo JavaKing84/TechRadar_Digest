@@ -1,84 +1,224 @@
-# news_ai_science · AI 科技头条机器人
+# TechRadar Digest
 
-TechCrunch / MIT TR / Wired / VentureBeat 抓正文 -> 中文标题 + 3~10 条摘要 -> 飞书**聚合图文卡**推群。
+抓科技媒体正文 → 大模型生成中文摘要 → 飞书图文卡片推群。
 
-一条消息装 1~5 条新闻（`column_set` 左图右文 + 折叠要点 + 点击查看原文），
-纯文本推送已废弃：卡片发不出去就保持 pending 等下一轮，不再降级成文本。
+需要 Python 3.11+、Git、6 GB 磁盘，能访问新闻站 / 飞书 / 大模型接口。
 
-## 快速开始
+下面所有命令都在**项目根目录**执行，都用 `.\.venv\Scripts\python.exe`，不要用系统 `python`。
+顺序不能换：依赖 → 内核 → 指纹模型 → `.env` → 试跑 → 正式跑，每一步是下一步的前提。
 
-```bash
-cd D:/!pythonproject/feishu_bot/TechRadar_Digest
+---
 
-# 1. 环境（已就绪，无需重装）
-#    .venv 里已有 camoufox 0.5.8 / playwright / openai / pyyaml / dotenv / bs4
-#    ⚠️ 严禁 pip install camoufox、严禁 python -m camoufox fetch
+## 1. 克隆并建虚拟环境
 
-# 2. 配置
-cp .env.example .env          # 填 LLM_API_KEY / FEISHU_WEBHOOK_URL / FEISHU_APP_*
-# 新闻源改 config/sources.yaml；其它参数改 config/config.yaml
-
-# 3. 跑一轮
-./.venv/Scripts/python.exe main.py --once
+```powershell
+git clone https://gitee.com/ncepu-bj/Techradar_Digest.git; cd Techradar_Digest
+python -m venv .venv
 ```
 
-## 常用命令
+验证：`.\.venv\Scripts\python.exe --version` 输出 3.11 以上。
 
-| 命令 | 作用 |
+**常见问题**
+
+| 报错 | 解决 |
 |---|---|
-| `python main.py --once` | 抓取 + 摘要 + 推送（定时任务跑的就是这个） |
-| `python main.py --once --dry-run` | 只生成卡片 JSON 到 `logs/`，不发群 |
-| `python main.py --once --no-push` | 只抓取入库 |
-| `python main.py --push-only` | 不抓取，只推队列里的待推条目 |
-| `python main.py --stats` | 看队列：`{"pending": n, "pushed": m}` |
-| `make test` / `make lint` | pytest（21 例）/ ruff |
+| `'python' 不是内部或外部命令` | 用 `py -3 -m venv .venv` 代替 |
+| `无法加载文件 Activate.ps1，因为在此系统上禁止运行脚本` | 不用激活，直接敲 `.\.venv\Scripts\python.exe` |
+| `python --version` 低于 3.11 | 重装 Python，勾上 Add python.exe to PATH |
 
-## 目录
+---
 
-```
-config/       sources.yaml（新闻源）  config.yaml（参数+密钥）  settings.py（只读常量）
-src/news_ai_science/
-  core/       路径、配置、日志、文本、异常
-  contracts/  Article
-  stages/     crawl(web) / generate(client, translator) / push(card_builder, image_uploader, feishu_sender)
-  pipeline/   runner
-  storage/    SQLite
-tests/        离线单测，不联网
-docs/         architecture.md（分层）  deployment.md（Docker 部署）
-.docker-assets/  Dockerfile 构建期用的离线内核安装脚本（zip 不进仓库）
-logs/         运行日志 + dry-run 卡片
+## 2. 装依赖
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-## Docker 部署（CentOS 7 / 内网）
+验证：`.\.venv\Scripts\python.exe -c "import camoufox, openai, yaml, bs4, lxml; print('ok')"` 输出 `ok`。
 
-目标服务器 glibc 只有 2.17，Camoufox 要求 ≥ 2.28，所以走镜像而非宿主机直装。
-镜像基于 `python:3.10-slim-bullseye`（Python 3.10.18 + glibc 2.31，实测）。
+**常见问题**
+
+| 报错 | 解决 |
+|---|---|
+| pip 很慢或 `ReadTimeoutError` | 命令末尾加 `-i https://mirrors.aliyun.com/pypi/simple` |
+| `ModuleNotFoundError: No module named 'yaml'` | 用了系统 python，命令必须是上面那一行 |
+| 装完发现 camoufox 是 0.5.9 | `.\.venv\Scripts\python.exe -m pip install camoufox==0.5.8 --force-reinstall`，再重做第 3 步 |
+
+> camoufox 必须是 0.5.8，它对应内核 156.0.1-beta.36。装成别的版本，SDK 会把已经下好的内核判为无效。
+
+---
+
+## 3. 装浏览器内核
+
+```powershell
+.\.venv\Scripts\python.exe -m camoufox fetch
+```
+
+验证：`.\.venv\Scripts\python.exe -m camoufox version` 里 `Installed: Yes`。
+
+**常见问题**
+
+| 现象 | 解决 |
+|---|---|
+| 下载卡住 / 中断 / `Connection was reset` | 用下面的离线包 |
+| `BadZipFile: File is not a zip file` | 下载到的是错误页，删了重下，校验不通过就别装 |
+| `[FAIL] 内核包不完整，缺少 camoufox.exe` | 下成 Linux 包了，换 `win` 那个 |
+| 缓存目录里文件都在，还是 `Installed: No` | 手动解压不算安装，必须跑 `install_offline_kernel.py` |
+| `CamoufoxNotInstalled` | 内核没装或版本不对，重做本步 |
+
+离线包（GitHub 下不动时）：
+
+```powershell
+curl.exe -fL -o camoufox-156.0.1-beta.36-win.x86_64.zip "https://ghfast.top/https://github.com/daijro/camoufox/releases/download/v156.0.1-beta.36/camoufox-156.0.1-beta.36-win.x86_64.zip"
+(Get-Item .\camoufox-156.0.1-beta.36-win.x86_64.zip).Length   # 必须是 1311638126
+.\.venv\Scripts\python.exe .docker-assets\install_offline_kernel.py .\camoufox-156.0.1-beta.36-win.x86_64.zip
+```
+
+大小对不上就是没下完或者下到了网页，别往下装。装完可以删掉 1.2 GB 的 zip。
+
+---
+
+## 4. 装指纹模型
+
+```powershell
+curl.exe -fL -o fpgen-model-release.zip "https://ghfast.top/https://github.com/scrapfly/fingerprint-generator/releases/download/model-2/2026/model-release.zip"
+(Get-Item .\fpgen-model-release.zip).Length   # 必须是 1564571
+.\.venv\Scripts\python.exe .docker-assets\install_fpgen_model.py .\fpgen-model-release.zip
+```
+
+只有 1.5 MB。不装的话，浏览器第一次启动时才会去 GitHub 拉，拉不到就抛异常，一条都抓不了。
+
+**常见问题**
+
+| 报错 | 解决 |
+|---|---|
+| `[FAIL] 模型包 sha256 不匹配` | 包下坏了，删了重下 |
+| `ValueError: Unable to create a ZSTDSeekContext` | 模型数据不完整，跑下面两行 |
+| `FpgenModelError` | 同上，说明自动下载也失败了 |
+
+```powershell
+Remove-Item ".\.venv\Lib\site-packages\fpgen\data" -Recurse -Force -ErrorAction SilentlyContinue
+.\.venv\Scripts\python.exe .docker-assets\install_fpgen_model.py .\fpgen-model-release.zip
+```
+
+---
+
+## 5. 配 .env
+
+```powershell
+Copy-Item .env.example .env; notepad .env
+```
+
+只填这三个，等号右边不加引号、不留空格：
+
+| 变量 | 从哪来 |
+|---|---|
+| `DEEPSEEK_API_KEY` | 大模型平台控制台 |
+| `FEISHU_WEBHOOK_URL` | 飞书群 → 群设置 → 群机器人 → 添加自定义机器人 |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 飞书开放平台 → 自建应用（不填卡片没配图） |
+
+验证：`.\.venv\Scripts\python.exe main.py --stats` 输出 `{"pending": 0, ...}`。
+
+**常见问题**
+
+| 报错 | 解决 |
+|---|---|
+| `[FATAL] 配置错误: 缺少 webhook_url` | `.env` 不在项目根，或名字不是 `.env`，或值还是空的 |
+| `LLM 调用失败 ... 404`，URL 里有两段 `chat/completions` | `LLM_BASE_URL` 只写到 `/v1`，不要带 `/chat/completions` |
+| `LLM 调用失败 ... 401` | Key 错了或没填 |
+| 改了 `.env` 不生效 | 用记事本重存；不要用 PowerShell 的 `-Encoding utf8` 写，PS 5.1 会加 BOM 导致第一个变量读不到 |
+| 连不上 `202.204.64.234` | 校内网地址，校外换成公网服务并同时改 `LLM_BASE_URL`、`LLM_MODEL` |
+
+`LLM_BASE_URL` 正确写法：默认留空走 DeepSeek，私有部署写 `http://ip:port/v1`，末尾只能是 `/v1`。
+
+---
+
+## 6. 验证 webhook
+
+```powershell
+.\.venv\Scripts\python.exe main.py --test-push
+```
+
+去群里看有没有收到。**这一步是唯一能确认消息落在哪个群的办法**，webhook 在添加机器人时就绑死了群。
+
+**常见问题**
+
+| 报错 | 解决 |
+|---|---|
+| `19021` | 机器人开了加签，补填 `FEISHU_WEBHOOK_SECRET` |
+| `19024` / `chat not found` | 机器人被删了，重新添加并换 URL |
+| 收到了但不在预期的群 | 换 `.env` 里的 `FEISHU_WEBHOOK_URL` |
+
+---
+
+## 7. 全链路演练，不发群
+
+```powershell
+.\.venv\Scripts\python.exe main.py --once --dry-run
+```
+
+正常会看到抓取、摘要、配图上传，最后把卡片写到 `logs\card_dryrun_*.json`，群里不会有消息。
+
+**常见问题**
+
+| 现象 | 解决 |
+|---|---|
+| 所有源 0 篇，日志全是 `DOMContentLoaded 未在 3000ms 内触发` | 新闻站要代理：`$env:HTTPS_PROXY = "http://127.0.0.1:7890"` 后重跑 |
+| `Target page, context or browser has been closed` | 内核或指纹模型没装好，回第 3、4 步 |
+| 一直 404 重试 | `LLM_BASE_URL` 写多了，见第 5 步 |
+| `本轮无新文章入库` | 正常去重，等新文章 |
+
+---
+
+## 8. 正式跑
+
+```powershell
+.\.venv\Scripts\python.exe main.py --once
+```
+
+群里收到卡片就通了。
+
+**常见问题**
+
+| 现象 | 解决 |
+|---|---|
+| 卡片没有配图 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 没填，或应用没发布 |
+| 每轮推的都是旧新闻 | `data\` 被删了，去重库丢了，别删它 |
+| 定时任务报「配置文件不存在」 | 任务计划程序的「起始于」必须填项目根目录 |
+
+日志在 `logs\bot.log`。
+
+---
+
+## 附：其他参数
+
+| 参数 | 作用 |
+|---|---|
+| `--stats` | 看队列 |
+| `--no-push` | 只抓取入库，不推送 |
+| `--push-only` | 不抓取，只推队列里待推的 |
+
+---
+
+## 附：Linux / Docker
+
+容器部署见 [`docs/deployment.md`](docs/deployment.md)。Linux 裸机安装：
 
 ```bash
-# 1. 构建（首次会装系统库 + 拉浏览器内核，10~30 分钟属正常）
-docker compose up -d --build
+git clone https://gitee.com/ncepu-bj/Techradar_Digest.git
+cd Techradar_Digest
+python3 -m venv .venv
+./.venv/bin/python -m pip install -r requirements.txt
 
-# 2. 看日志
-docker compose logs -f
+sudo apt-get update && sudo apt-get install -y libgtk-3-0 libdbus-glib-1-2 libxt6 libasound2 \
+  libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
+  libatk1.0-0 libatk-bridge2.0-0 libcups2 libnss3 libnspr4 libxfixes3 libxkbcommon0 \
+  libxrender1 libxi6 libgl1 libxext6 libxcb1 fonts-noto-cjk
 
-# 3. 只跑一轮 / 查队列（不进常驻循环）
-docker compose run --rm news-ai-science python main.py --once --dry-run
-docker compose run --rm news-ai-science python main.py --stats
+cp .env.example .env
+./.venv/bin/python -m camoufox fetch
+./.venv/bin/python -m camoufox version
+./.venv/bin/python main.py --once
 ```
 
-前置条件只有两个：
-
-- **`.env` 必须在项目根目录**（被 `.gitignore` 排除，clone 下来没有，需单独传）
-- **浏览器内核**：构建期若无 `.docker-assets/camoufox-*-lin*.zip`，会联网走
-  `python -m camoufox fetch`；服务器出不了 GitHub 时必须放离线包（约 1.3 GB，不进仓库）
-
-命名规则、离线安装原理、服务器端逐步操作、代理与排错，全部见
-[`docs/deployment.md`](docs/deployment.md)。
-
-## 注意
-
-- **抓取必须走 Camoufox**：没有 RSS 路径，没有 requests 降级；单源失败跳过，全源失败才抛错。
-- **没有配图就不推这一条**：`crawl.require_image: true`，绝不用无关图凑数。
-- **不要重复装 Camoufox 内核**：内核在 `%LOCALAPPDATA%\camoufox\...\156.0.1-beta.36`，与 venv 无关。
-- **配图需要飞书应用凭证**（群机器人没有上传图片的权限），凭证缺失时卡片会无图。
-- **定时任务**：每日 08:00 / 20:00，命令是 `python main.py --once`。
+其余步骤与 Windows 相同，把 `.\.venv\Scripts\python.exe` 换成 `./.venv/bin/python`。Linux 内核包用 `*-lin*.zip`，`install_offline_kernel.py` 会自动补可执行权限。

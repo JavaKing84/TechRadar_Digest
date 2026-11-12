@@ -1,25 +1,10 @@
-# =====================================================================
-# [文件] requirements.txt
-# [职责] Docker 镜像内的依赖清单（由 pyproject.toml 的 dependencies 派生）。
-# [为什么需要它] pyproject 里写着 requires-python = ">=3.11"，而部署镜像
-#   按老师要求用 Python 3.10；直接 `pip install .` 会被元数据挡下
-#   （"requires a different Python: 3.10.x not in '>=3.11'"）。
-#   改用 `pip install -r requirements.txt` 装依赖、代码走 main.py 的
-#   sys.path 注入，即可在 3.10 下正常运行。若改回 3.11 基础镜像，
-#   requirements.txt 与 `pip install .` 两者都可以。
-# [版本策略] camoufox 必须与 Dockerfile 的 CAMOUFOX_VERSION 及浏览器内核
-#   版本严格对应（SDK 0.5.8 -> 内核 156.0.1-beta.36），所以钉死；
-#   playwright 被 camoufox 约束在 <1.63，这里显式写出来避免解析歧义。
-# =====================================================================
+# 依赖清单。camoufox 版本必须对应浏览器内核 156.0.1-beta.36，不要随意升级；
+# playwright 被 camoufox 约束在 <1.63；lxml 是 BeautifulSoup 的解析器，必须显式写。
 camoufox==0.5.8
 playwright>=1.40,<1.63
 openai>=1.30
 PyYAML>=6.0
 python-dotenv>=1.0
 beautifulsoup4>=4.12
-# [lxml 必须显式写] 代码用 BeautifulSoup(html, "lxml")，但本机 venv 里 lxml
-#   是别的东西顺带装的，干净镜像里没有 —— 容器内实测报
-#   "Couldn't find a tree builder with the features you requested: lxml"，
-#   所有文章页解析失败、整轮采集抛 CrawlError。pyproject 也一并补上了。
 lxml>=5.0
 requests>=2.31

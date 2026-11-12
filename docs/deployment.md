@@ -106,6 +106,12 @@ sudo docker compose build \
 上线后才在运行时炸。本 Dockerfile 已改为 `curl -fL`（HTTP 非 2xx 即失败）+
 安装后 `test -x .../camoufox` 强校验，**内核缺失会让构建直接失败**，而不是产出空壳镜像。
 
+> 注意范围：这条禁令只针对 **Docker 构建期**（构建日志没人会盯，且希望失败即中断）。
+> 开发者在**本机**装内核时 `python -m camoufox fetch` 完全可用，装完用
+> `python -m camoufox version` 确认 `Installed: Yes` 即可，详见根目录 README 第 1.5 节。
+> 另：`install_offline_kernel.py` 已改为按平台校验启动文件，
+> Windows 内核包（`camoufox-*-win*.zip`）也能用它离线安装。
+
 ---
 
 ## 五、服务器端步骤（MobaXterm，逐行粘贴）
